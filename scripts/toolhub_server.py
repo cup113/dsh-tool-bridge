@@ -27,6 +27,16 @@ job cannot leave an orphaned ``flutter``/``dart`` writing into ``build/``.
 (``--watch-parent`` exists because stdin is useless here: a DSH background job's
 stdin is already closed at spawn, so an EOF check exits instantly.)
 
+Progress for a human
+--------------------
+At boot the server opens the tokenised status page in the default browser
+(``--no-open`` to suppress). The server is normally launched by an agent as a
+background job, so the ``STATUS`` line is the one thing the human needs and the
+one thing that is hard to find: it scrolls out of view in a job that by design
+never exits, and the port is random. Opening the page removes that discovery
+step; the ``STATUS`` line stays as the durable record and the fallback for a
+headless box, and opening is best-effort — it never delays or fails the boot.
+
 Boot self-check
 ---------------
 With the default ``--selfcheck``, the server runs ``flutter --version`` before
@@ -62,6 +72,7 @@ import tempfile
 import threading
 import time
 import uuid
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 IS_WINDOWS = os.name == "nt"
@@ -617,6 +628,49 @@ def stop_soon() -> None:
     os._exit(0)
 
 
+def open_status_page(url: str) -> None:
+    """Best-effort: put the live status page in front of the human.
+
+    The ``STATUS`` line is the durable record, but the common case is an agent
+    launching this as a background job: the line scrolls out of view in a job
+    that never exits, and the browser needs the random port *and* the token, so
+    "read the log and paste it" is the step worth deleting.
+
+    Never raises and never blocks the boot: a headless box, a locked-down
+    default browser or a ShellExecute refusal must all degrade to the STATUS
+    line rather than cost the session its toolchain server.
+    """
+    try:
+        opened = webbrowser.open(url, new=2)
+    except Exception as error:  # noqa: BLE001 - opening is a convenience
+        eprint(f"TOOLHUB OPEN FAILED reason={error!r} url={redacted(url)}")
+        return
+    if opened:
+        eprint(f"TOOLHUB OPEN opened in the default browser url={redacted(url)}")
+    else:
+        eprint(
+            "TOOLHUB OPEN FAILED reason=no-browser-answered "
+            f"url={redacted(url)}"
+        )
+
+
+def open_soon(url: str, delay: float = 0.3) -> None:
+    """Opens the status page off the boot path, once the socket is serving.
+
+    The listener is already bound (and its backlog accepts) before this thread
+    starts, but the delay keeps the very first page load from racing
+    ``serve_forever`` — a human looking at "server unreachable" on the tab that
+    was just opened for them would be worse than not opening it at all.
+    """
+    time.sleep(delay)
+    open_status_page(url)
+
+
+def redacted(url: str) -> str:
+    """The status URL with the token masked, for log lines and error text."""
+    return re.sub(r"token=[^&\s]+", "token=***", url)
+
+
 def status_page(token: str) -> str:
     """Self-contained page: job list plus the running job's live log tail."""
     return f"""<!DOCTYPE html>
@@ -836,6 +890,23 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--open",
+        dest="open_browser",
+        action="store_true",
+        default=True,
+        help=(
+            "open the tokenised status page in the default browser at boot "
+            "(default; this is how a human following an agent-launched server "
+            "finds the random port)"
+        ),
+    )
+    parser.add_argument(
+        "--no-open",
+        dest="open_browser",
+        action="store_false",
+        help="do not open a browser: headless boxes, automation, scripted tests",
+    )
+    parser.add_argument(
         "--log-dir",
         default=None,
         help="directory for job logs (default: a fresh temp dir)",
@@ -871,11 +942,12 @@ def main() -> int:
     server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     server.daemon_threads = True
     port = server.server_address[1]
+    status_url = f"http://127.0.0.1:{port}/?token={token}"
     eprint(
         f"TOOLHUB READY port={port} pid={os.getpid()} cwd={cwd} logdir={log_dir}"
     )
     eprint(f"TOOLHUB TOKEN {token}")
-    eprint(f"TOOLHUB STATUS http://127.0.0.1:{port}/?token={token}")
+    eprint(f"TOOLHUB STATUS {status_url}")
 
     if args.watch_parent:
         threading.Thread(
@@ -883,6 +955,8 @@ def main() -> int:
             args=(hub, os.getppid()),
             daemon=True,
         ).start()
+    if args.open_browser:
+        threading.Thread(target=open_soon, args=(status_url,), daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:

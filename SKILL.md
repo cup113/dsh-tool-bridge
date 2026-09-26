@@ -46,6 +46,16 @@ TOOLHUB STATUS http://127.0.0.1:60549/?token=2SV0dcqLovVR4FSntAjkau_cy7OdGE5b
 Read port and token with `job_output`. Never write them to a file: they live in
 the harness's job output and in server memory only.
 
+**The boot opens the status page in the default browser** — that tab is the
+human's progress view, and it is why the `STATUS` line never has to be hunted
+for: this server runs as a background job that by design does not exit, so a
+line printed at boot scrolls out of view, and the port is random. Opening the
+page is best-effort and never delays or fails the boot (`TOOLHUB OPEN ...` says
+whether it worked); `--no-open` suppresses it on a headless box or under
+scripted tests, and `TOOLHUB STATUS` stays the fallback either way. Reporting
+that URL to the human in a reply is fine — it is already in the job output this
+skill tells you to read — but it still must not be written to a file.
+
 Optional startup work (queued before the socket opens), e.g. to warm a build
 while the agent does something else:
 
@@ -92,7 +102,7 @@ session binds a new random port.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/health` | liveness; no token |
-| GET | `/?token=…` | human status page: job list + live log tail (browser-friendly) |
+| GET | `/?token=…` | human status page: job list + live log tail (browser-friendly; opened automatically at boot) |
 | POST | `/run` | `{"cmd","args","wait","timeoutSec"}` → job; `wait:true` blocks until done |
 | GET | `/jobs` | all jobs, newest last |
 | GET | `/jobs/<id>?tail=N` | one job + last N log lines (default 200) |
@@ -149,6 +159,10 @@ is still a fresh process. The wins are friction, correctness and observability.
 - Binds `127.0.0.1` only, on an ephemeral port.
 - Random 32-char token, constant-time compared; the token exists only in the
   harness's job output and server memory.
+- Auto-open is the one place the token leaves memory on purpose: it lands in the
+  default browser's address bar and history. That is the same machine and the
+  same user who already reads the job output, and the page needs the token to
+  poll `/jobs` at all.
 - Command allowlist (above) enforced in Python, argv-list execution, `cwd`
   pinned at startup.
 - The process itself runs with full access for its lifetime — that trust is the
@@ -158,6 +172,14 @@ is still a fresh process. The wins are friction, correctness and observability.
 
 - **Connection refused** → the server exited (or was never started). Read the
   job output; restart it.
+- **No browser tab appeared** → look for `TOOLHUB OPEN`: `no-browser-answered`
+  means there is no usable default browser (headless box, or `BROWSER` pointing
+  at a console browser), `reason=...` carries the exception. The server is
+  unaffected — use the `TOOLHUB STATUS` URL, or pass `--no-open` if you did not
+  want the tab.
+- **Every restart opens another tab** → expected: the port and token are
+  per-process, so a new tab is a new live view and the older ones go stale. Do
+  not "fix" it by disabling auto-open; tell the human which tab is current.
 - **`401 missing or bad token`** → wrong/missing token, or the peer was
   unpaired. Re-read the `TOOLHUB TOKEN` line.
 - **Job stuck in `queued`** → something ahead of it is still running; check
@@ -173,6 +195,12 @@ is still a fresh process. The wins are friction, correctness and observability.
   `bin/cache` itself.
 - **Leftover `.tmp` peer files** in a repo's sync dir are harmless: readers
   ignore anything not ending in `.json`.
+- **Confined (`workspace-write`) `--no-selfcheck` boot dies with
+  `PermissionError: ...\Temp\dsh-*\toolhub-*\...log`** → the default job-log
+  directory is `tempfile.mkdtemp()`, which the sandbox denies. That is a
+  property of running it unelevated, not of the toolchain, and it is why the
+  real start is the elevated one. To smoke-test the HTTP surface inside the
+  sandbox, pass `--log-dir` pointing into the workspace.
 
 ## Non-goals (deliberate)
 

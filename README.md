@@ -18,6 +18,12 @@ Started plainly it fails its boot self-check on purpose (the sandbox denies the
 SDK lockfile write); that failure is the evidence for retrying the same command
 with `danger-full-access`. See the skill for the API and the client snippets.
 
+At boot it opens the tokenised status page in the default browser: this thing is
+normally launched by an agent as a background job that never exits, so the URL
+printed at startup is exactly the line a human cannot find. Pass `--no-open` on
+a headless box or in automation; the printed `TOOLHUB STATUS` URL is the
+fallback.
+
 ## Where the rest lives
 
 - Skill entry (what DSH discovers, with the API reference and troubleshooting):

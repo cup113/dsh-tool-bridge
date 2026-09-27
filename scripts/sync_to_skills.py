@@ -1,4 +1,4 @@
-"""Deploys this project to the DSH skill root (everything except .git).
+"""Deploys this project to the DSH skill root (SKILL.md and the scripts only).
 
 The repository is the source of truth; DSH discovers and loads the copy under
 ~/.dsh/skills/<skill-name>/SKILL.md, where <skill-name> comes from this
@@ -8,6 +8,11 @@ differ on purpose here: the repo is `dsh-tool-bridge`, the skill is
 
     python scripts/sync_to_skills.py             # deploy
     python scripts/sync_to_skills.py --dry-run   # show what would change
+
+The deployed skill carries no documentation: `README.md`, `CONTEXT.md`, `docs/`
+and `tests/` are excluded and stay in the repository. Because the destination is
+pruned of anything the project no longer has, excluding a file also removes an
+already-deployed copy of it.
 """
 
 from __future__ import annotations
@@ -21,8 +26,12 @@ import shutil
 import sys
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXCLUDE_DIRS = {".git", "__pycache__", ".idea", ".vscode"}
+EXCLUDE_DIRS = {".git", "__pycache__", ".idea", ".vscode", ".ruff_cache", "docs", "tests"}
 EXCLUDE_SUFFIXES = (".pyc", ".pyo")
+# Repository-only files: the deployed skill is SKILL.md plus the server, and
+# deliberately carries no documentation. Note that excluding a file also prunes
+# an already-deployed copy of it.
+EXCLUDE_FILES = {"README.md", "CONTEXT.md"}
 
 
 def skill_name(root: str) -> str:
@@ -40,6 +49,8 @@ def skill_name(root: str) -> str:
 
 
 def excluded(rel: str) -> bool:
+    if os.path.basename(rel) in EXCLUDE_FILES:
+        return True
     if any(part in EXCLUDE_DIRS for part in rel.split(os.sep)):
         return True
     return rel.endswith(EXCLUDE_SUFFIXES)

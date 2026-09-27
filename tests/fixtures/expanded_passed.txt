@@ -1,0 +1,2 @@
+00:18 +30: C:/ws/test/core/widget_test.dart: widget renders
+00:20 +33 ~2: All tests passed!

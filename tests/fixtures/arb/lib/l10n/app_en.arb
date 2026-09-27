@@ -1,0 +1,11 @@
+{
+  "firstKey": "First",
+  "withMeta": "With meta {count}",
+  "@withMeta": {
+    "placeholders": {
+      "count": {}
+    }
+  },
+  "midKey": "Mid",
+  "lastKey": "Last"
+}

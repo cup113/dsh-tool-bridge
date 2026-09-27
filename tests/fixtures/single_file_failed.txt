@@ -1,0 +1,8 @@
+00:03 +5 -1: my failing test [E]
+  Expected: 1
+    Actual: 2
+  
+00:03 +5 -1: Some tests failed.
+
+Failing tests:
+  C:/ws/test/unit/thing_test.dart: my failing test

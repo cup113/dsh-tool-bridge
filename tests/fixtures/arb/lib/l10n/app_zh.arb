@@ -1,0 +1,11 @@
+{
+  "firstKey": "第一项",
+  "withMeta": "带元数据 {count}",
+  "@withMeta": {
+    "placeholders": {
+      "count": {}
+    }
+  },
+  "midKey": "中间",
+  "lastKey": "最后"
+}

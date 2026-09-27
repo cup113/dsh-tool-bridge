@@ -1,3 +1,13 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Scratch directory for the confined smoke test (see SKILL.md).
+.toolhub-smoke/
+
+# Scratch copy of the ARB fixture tree used by the arb-edit job tests.
+tests/.tmp-arbtool/
+tests/.tmp-arbtool-logs/
+
+# Ruff's cache, created by `ruff check` in the repository root.
+.ruff_cache/

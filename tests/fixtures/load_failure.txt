@@ -1,0 +1,8 @@
+00:01 +0 -1: loading C:/ws/test/broken_test.dart [E]
+  Failed to load "C:/ws/test/broken_test.dart":
+  Error: Error when reading 'lib/missing.dart': No such file or directory
+  
+00:01 +0 -1: Some tests failed.
+
+Failing tests:
+  C:/ws/test/broken_test.dart: loading C:/ws/test/broken_test.dart

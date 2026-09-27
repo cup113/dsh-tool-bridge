@@ -1,0 +1,5 @@
+{
+  "app_zh_Hant.arb": [
+    "midKey"
+  ]
+}

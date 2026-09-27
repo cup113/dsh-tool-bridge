@@ -1,0 +1,40 @@
+00:08 +70: C:/ws/test/desktop/alpha_test.dart: alpha accepts a good key
+00:09 +74: C:/ws/features/feed/gamma_test.dart: gamma boots
+00:10 +75: C:/ws/features/feed/delta_test.dart: delta sorts
+00:11 +76 -1: C:/ws/test/desktop/alpha_test.dart: alpha refuses a bad key [E]
+  Expected: 'expected-key'
+    Actual: 'actual-key'
+     Which: is different.
+  
+  package:matcher                                                   expect
+  test/desktop/alpha_test.dart 44:5                                 main.<fn>
+  
+00:12 +77 -2: C:/ws/test/desktop/bravo_test.dart: bravo retries once [E]
+  Expected: <3>
+    Actual: <1>
+  
+  package:matcher                                                   expect
+  test/desktop/bravo_test.dart 19:5                                 main.<fn>
+  
+00:13 +78 -3: C:/ws/features/feed/gamma_test.dart: gamma restores state [E]
+  Expected: true
+    Actual: false
+  
+00:13 +79: C:/ws/features/feed/zeta_test.dart: zeta loads
+00:14 +80 -4: C:/ws/features/feed/delta_test.dart: delta dedupes [E]
+  Expected: <2>
+    Actual: <3>
+  
+00:14 +82 -5: C:/ws/features/feed/epsilon_test.dart: epsilon syncs - did not complete [E]
+00:15 +83 -6: C:/ws/features/feed/zeta_test.dart: zeta handles empty [E]
+  Expected: <0>
+    Actual: <1>
+  
+00:15 +83 -6: Some tests failed.
+
+Failing tests:
+  C:/ws/features/feed/delta_test.dart: delta dedupes
+  C:/ws/features/feed/epsilon_test.dart: epsilon syncs (did not complete)
+  C:/ws/features/feed/gamma_test.dart: gamma restores state
+  C:/ws/features/feed/zeta_test.dart: zeta handles empty
+  ... and 2 more

@@ -1,0 +1,2 @@
+00:01 +4: C:/ws/test/core/a_test.dart: a passes
+00:02 +5: C:/ws/test/core/b_test.dart: b passes

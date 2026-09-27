@@ -12,11 +12,14 @@ nothing.
 
 What it is not
 --------------
-It is not a shell. Only ``flutter``/``dart`` (any subcommand) and a small,
-non-destructive ``git`` verb set are accepted, always as an argv list (never a
-shell string), always in the working directory pinned at startup. ``git push``
-is deliberately absent: the GitHub token must never live in a long-running
-process.
+It is not a shell, and it is not a privilege boundary: `dart` runs any
+subcommand, so `dart run <file>.dart` already executes arbitrary code with the
+access this process was granted. The narrow surface buys *recovery cost and
+surprise* — a refused command is one you cannot lose work to — not privilege.
+Only ``flutter``/``dart`` (any subcommand) and a small, guard-railed ``git``
+verb set are accepted, always as an argv list (never a shell string) and always
+in the working directory pinned at startup. ``git push`` is deliberately absent:
+the GitHub token must never live in a long-running process.
 
 Lifecycle
 ---------
@@ -49,12 +52,29 @@ API (all but /health need ``Authorization: Bearer <token>``)
 -----------------------------------------------------------
 - ``GET  /health``                -> {"ok": true}
 - ``GET  /``                      -> human status page (token in the query string)
-- ``POST /run``                   -> {"cmd","args","wait","timeoutSec"} -> job
+- ``POST /run``                   -> {"cmd","args","message","wait","timeoutSec",
+                                     "grep","tail"} -> job
 - ``GET  /jobs``                  -> [job]
-- ``GET  /jobs/<id>?tail=N``      -> job + last N log lines
+- ``GET  /jobs/<id>?tail=N&grep=P`` -> job + last N log lines (or the last N
+                                     lines matching the P regex)
 - ``GET  /jobs/<id>/log``         -> raw log text (whole file; use ?tail= to trim)
 - ``POST /jobs/<id>/kill``        -> kill the process tree
+- ``POST /tools/<name>``          -> a sub-tool job; currently ``arb-edit``,
+                                     whose body is the ARB instruction JSON and
+                                     whose job carries a structured ``result``
 - ``POST /stop``                  -> kill children and exit
+
+Sub-tools
+---------
+A sub-tool is a named operation the bridge executes as a Job (ADR-0003): it
+waits in the same queue, writes the same kind of log, is killed the same way,
+and answers ``wait``/``timeoutSec``/``tail``/``grep`` exactly like ``/run``.
+Only its body differs — instead of an argv it takes the instruction JSON, and
+instead of a test digest its job carries a structured ``result``. The first
+member is ``arb-edit`` (see ``arb_edit_lib``), which is why the retired
+``flutter-arb-edit`` skill no longer needs its own elevated step: ``flutter
+gen-l10n`` now runs in the pinned cwd, on the one worker, through the same
+``resolve_launch`` that keeps ``cmd.exe`` out of the path.
 """
 
 from __future__ import annotations
@@ -71,9 +91,21 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import uuid
 import webbrowser
+from collections import deque
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import TypedDict
+
+# Sub-tool libraries ship next to this file — in the repository and in the
+# deployed skill alike — so that directory has to be importable before they can
+# be imported. Done before the import below on purpose (it is not stdlib).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import arb_edit_lib
 
 IS_WINDOWS = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
@@ -81,12 +113,24 @@ CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 # How much of a job's log is scanned for a tail, and the default tail length.
 TAIL_SCAN_BYTES = 256 * 1024
 DEFAULT_TAIL_LINES = 200
+MAX_TAIL_LINES = 5000
 
 ALLOWED_EXES = {"flutter", "dart", "git"}
 
-# git verbs this server will run. Everything else (reset, checkout, clean,
-# restore, push, config, rebase, ...) is refused by omission.
-GIT_VERBS = {"status", "diff", "log", "add", "commit", "branch"}
+# The registered sub-tools (ADR-0003). A sub-tool is a named operation executed
+# as a Job — it queues behind builds like everything else and reports a
+# structured `result` instead of a test digest.
+TOOL_NAMES = ("arb-edit",)
+
+# Request fields the sub-tool route owns, exactly like `/run` does. Everything
+# else in the body belongs to the sub-tool's own instruction, so these must be
+# stripped before the instruction is validated — otherwise `wait` reads as an
+# unknown instruction field and the documented request shape is a 400.
+TOOL_TRANSPORT_FIELDS = frozenset({"wait", "timeoutSec", "grep", "tail"})
+
+# git verbs this server will run. Everything else (reset, clean, checkout,
+# switch, stash, push, config, rebase, ...) is refused by omission.
+GIT_VERBS = {"status", "diff", "log", "add", "commit", "branch", "restore"}
 
 # Per-verb flags that turn a safe verb destructive.
 GIT_BLOCKED_FLAGS = {
@@ -96,6 +140,41 @@ GIT_BLOCKED_FLAGS = {
     "status": set(),
     "diff": set(),
     "log": set(),
+}
+
+# Verbs whose flag surface is an allow list rather than a deny list.
+#
+# `restore` is the one allowed verb that can irrecoverably discard uncommitted
+# work, so both directions of its blast radius have to be bounded: which flags,
+# and which pathspecs. The deny list above cannot express that (there is no
+# short list of dangerous flags — the dangerous thing is the default), so the
+# guard is inverted for this verb. Everything absent here — `--source`,
+# `--pathspec-from-file`, `-p/--patch`, `--recurse-submodules`, `-m/--merge`,
+# `--overlay` — is refused by omission.
+GIT_ALLOWED_FLAGS = {
+    "restore": {"-S", "--staged", "-W", "--worktree", "-q", "--quiet"},
+}
+
+# Characters that make a pathspec a pattern instead of a path. `restore`
+# refuses them: the point of allowing restore is "undo these named files", and
+# `git restore .` (or `test/**`) is the whole-worktree wipe the bridge exists to
+# keep out of reach.
+PATHSPEC_WILDCARDS = set("*?[]")
+
+# Arguments that carry a commit message, so an inline `message` field cannot
+# silently fight with one of them.
+MESSAGE_SOURCE_FLAGS = {
+    "-m",
+    "--message",
+    "-F",
+    "--file",
+    "-C",
+    "--reuse-message",
+    "-c",
+    "--reedit-message",
+    "--fixup",
+    "--squash",
+    "--no-edit",
 }
 
 
@@ -121,13 +200,24 @@ def eprint(*parts: object) -> None:
 
 
 class Job:
-    """One queued/running/finished command."""
+    """One queued/running/finished command or sub-tool call."""
 
-    def __init__(self, argv: list[str], cwd: str, log_path: str) -> None:
+    def __init__(
+        self,
+        argv: list[str],
+        cwd: str,
+        log_path: str,
+        runner: Callable[[Job], None] | None = None,
+    ) -> None:
         self.id = uuid.uuid4().hex[:12]
+        # For a sub-tool job this is the display argv the status page shows;
+        # nothing spawns it (the runner decides what to run).
         self.argv = argv
         self.cwd = cwd
         self.log_path = log_path
+        # A runner means "sub-tool": the worker calls it instead of spawning
+        # argv, which is what keeps a sub-tool on the one-job-at-a-time queue.
+        self.runner = runner
         self.status = "queued"  # queued|running|done|failed|killed
         self.exit_code: int | None = None
         self.resolved: list[str] | None = None
@@ -135,8 +225,17 @@ class Job:
         self.finished_at: float | None = None
         self.error: str | None = None
         self.summary: str | None = None
+        self.counts: TestCounts | None = None
+        self.failures: list[TestFailure] = []
+        # The structured outcome of a sub-tool; None for a command job.
+        self.result: dict[str, object] | None = None
         self._process: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
+
+    @property
+    def kind(self) -> str:
+        """`tool` for a sub-tool job, `cmd` for an argv job."""
+        return "tool" if self.runner is not None else "cmd"
 
     def set_process(self, process: subprocess.Popen[bytes]) -> None:
         with self._lock:
@@ -174,9 +273,14 @@ class Job:
             eprint(f"ERROR kill failed for {self.id}: {error}")
         return True
 
-    def to_json(self, tail_lines: int | None = None) -> dict[str, object]:
+    def to_json(
+        self,
+        tail_lines: int | None = None,
+        grep: re.Pattern[str] | None = None,
+    ) -> dict[str, object]:
         payload: dict[str, object] = {
             "id": self.id,
+            "kind": self.kind,
             "argv": self.argv,
             "resolvedArgv": self.resolved,
             "status": self.status,
@@ -189,16 +293,26 @@ class Job:
                 else round((self.finished_at or time.time()) - self.started_at, 2)
             ),
             "summary": self.summary,
+            "counts": self.counts,
             "error": self.error,
+            "result": self.result,
             "logPath": self.log_path,
         }
         if tail_lines is not None:
-            payload["tail"] = read_tail(self.log_path, tail_lines)
+            text, log_meta = read_filtered(self.log_path, grep, tail_lines)
+            payload["tail"] = text
+            payload["log"] = log_meta
+            # The failure inventory rides with the log view: it is a list, and
+            # the `/jobs` overview (which carries no log) would otherwise repeat
+            # every failure of every job.
+            payload["failures"] = self.failures
         return payload
 
 
 def read_tail(path: str, lines: int) -> str:
     """Last ``lines`` lines of a log file, read from the end (bounded memory)."""
+    if lines <= 0:
+        return ""
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -214,28 +328,447 @@ def read_tail(path: str, lines: int) -> str:
     return "\n".join(split[-lines:])
 
 
-def parse_summary(argv: list[str], log_path: str) -> str | None:
-    """A one-line digest for `flutter test`, else None.
+def read_filtered(
+    path: str, grep: re.Pattern[str] | None, lines: int
+) -> tuple[str, dict[str, object]]:
+    """The log tail, optionally keeping only lines a regex matches.
 
-    The raw exit code says pass/fail; this says *how much* passed, which is what
-    a reader actually wants from a ten-minute suite.
+    Without ``grep`` this is the historical bounded end-of-file read and the
+    metadata is empty. With ``grep`` the *whole* file is streamed once, because
+    a 256 KiB window would answer "no matches" for a failure sitting earlier in
+    the file — a filter that lies is worse than no filter. Only the last
+    ``lines`` matches are kept (bounded memory) while every match is counted, so
+    the caller can tell "none" from "not all of them".
     """
-    if len(argv) < 2 or os.path.basename(argv[0]).split(".")[0] != "flutter":
-        return None
-    if argv[1] != "test":
-        return None
-    text = read_tail(log_path, 400)
-    if "All tests passed!" in text:
-        match = re.findall(r"\+(\d+)(?:\s+~\d+)?(?:\s+-(\d+))?:", text)
-        if match:
-            passed, failed = match[-1]
-            return f"{passed} passed" + (f", {failed} failed" if failed else "")
-        return "all tests passed"
-    match = re.findall(r"\+(\d+)(?:\s+~\d+)?\s+-(\d+):", text)
-    if match:
-        passed, failed = match[-1]
+    if grep is None:
+        return read_tail(path, lines), {
+            "grep": None,
+            "matched": None,
+            "returned": None,
+            "scannedLines": None,
+            "truncated": False,
+        }
+    kept: deque[str] = deque(maxlen=max(0, lines))
+    matched = 0
+    scanned = 0
+    try:
+        # Text mode with universal newlines: a `compact` reporter log separates
+        # progress lines with a bare CR, which byte-wise iteration would treat
+        # as one enormous line.
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                scanned += 1
+                line = raw.rstrip("\n")
+                if grep.search(line):
+                    matched += 1
+                    if lines > 0:
+                        kept.append(line)
+    except OSError:
+        pass
+    returned = len(kept)
+    return "\n".join(kept), {
+        "grep": grep.pattern,
+        "matched": matched,
+        "returned": returned,
+        "scannedLines": scanned,
+        "truncated": matched > returned,
+    }
+
+
+def one(values: list[str] | None) -> str | None:
+    """The first value of a query parameter, if it was given at all."""
+    return values[0] if values else None
+
+
+def parse_log_query(grep: object, tail: object) -> tuple[int, re.Pattern[str] | None]:
+    """Validates the ``grep``/``tail`` log knobs. Raises ValueError.
+
+    Accepts the same two values from a JSON body (int) and from a query string
+    (str), so both routes share one interpretation.
+    """
+    pattern: re.Pattern[str] | None = None
+    if grep is not None:
+        if not isinstance(grep, str):
+            raise ValueError("grep must be a string")
+        if not grep:
+            raise ValueError("grep must not be empty")
+        try:
+            pattern = re.compile(grep)
+        except re.error as error:
+            raise ValueError(f"grep is not a valid regex: {error}") from error
+    if tail is None:
+        lines = DEFAULT_TAIL_LINES
+    elif isinstance(tail, bool):
+        raise ValueError("tail must be an integer")
+    elif isinstance(tail, int):
+        lines = tail
+    elif isinstance(tail, str) and tail.strip().lstrip("-").isdigit():
+        lines = int(tail)
+    else:
+        raise ValueError("tail must be an integer")
+    return max(0, min(MAX_TAIL_LINES, lines)), pattern
+
+
+# A `package:test` progress line: "00:25 +67 ~2 -4: <description>".
+TEST_COUNTS_RE = re.compile(r"^\d\d:\d\d \+(\d+)(?: ~(\d+))?(?: -(\d+))?: ")
+# A failing test's progress line, with the `[E]` marker the reporters append.
+TEST_FAILURE_RE = re.compile(
+    r"^\d\d:\d\d \+\d+(?: ~\d+)?(?: -\d+)?: (?P<name>.+?)"
+    r"(?P<unfinished> - did not complete)? \[E\]$"
+)
+TEST_BLOCK_HEADER = "Failing tests:"
+TEST_BLOCK_MORE_RE = re.compile(r"^\.\.\. and (\d+) more$")
+TEST_DID_NOT_COMPLETE = " (did not complete)"
+TEST_TERMINAL_MARKERS = (
+    "All tests passed!",
+    "All other tests passed!",
+    "All tests skipped.",
+    "Some tests failed.",
+)
+
+
+class TestFailure(TypedDict):
+    """One failing (or unfinished) test, as the progress lines report it."""
+
+    file: str | None
+    name: str
+    didNotComplete: bool
+
+
+class TestCounts(TypedDict):
+    """The counts on the last `+passed ~skipped -failed:` progress line."""
+
+    passed: int
+    skipped: int
+    failed: int
+
+
+class TestLogDigest(TypedDict):
+    """The result of `analyze_test_log`."""
+
+    summary: str | None
+    counts: TestCounts | None
+    failures: list[TestFailure]
+
+
+def is_test_run(argv: list[str]) -> bool:
+    """Whether argv is a `flutter test` / `dart test` invocation."""
+    if len(argv) < 2:
+        return False
+    return command_name(argv[0]) in ("flutter", "dart") and argv[1] == "test"
+
+
+def split_path_and_name(text: str) -> tuple[str | None, str]:
+    """Splits a reporter `path: name` description, if it really has a path.
+
+    A single-file run prints no path at all (`printPath` is on only when more
+    than one test file was selected) and a test name may contain a colon, so the
+    head has to *look* like a path: end in `.dart` or contain a separator.
+    """
+    head, sep, tail = text.partition(": ")
+    if sep and ("/" in head or "\\" in head or head.endswith(".dart")):
+        return head, tail
+    return None, text
+
+
+def split_block_entry(text: str) -> TestFailure:
+    """One `path: name` line of the `Failing tests:` block."""
+    finished = not text.endswith(TEST_DID_NOT_COMPLETE)
+    if not finished:
+        text = text[: -len(TEST_DID_NOT_COMPLETE)]
+    file, name = split_path_and_name(text)
+    return {"file": file, "name": name, "didNotComplete": not finished}
+
+
+def attach_paths(
+    failures: list[TestFailure], block: list[TestFailure]
+) -> list[TestFailure]:
+    """Lends block paths to path-less failures, then appends block orphans.
+
+    Order and completeness stay the `[E]` lines' (run order, uncapped); the
+    block only ever supplies a missing file. An entry the block reports but the
+    progress lines missed is appended rather than dropped.
+    """
+    used: set[int] = set()
+    for entry in failures:
+        for index, candidate in enumerate(block):
+            if index in used or candidate["name"] != entry["name"]:
+                continue
+            used.add(index)
+            if entry["file"] is None:
+                entry["file"] = candidate["file"]
+            entry["didNotComplete"] = bool(
+                entry["didNotComplete"] or candidate["didNotComplete"]
+            )
+            break
+    for index, candidate in enumerate(block):
+        if index not in used:
+            failures.append(TestFailure(**candidate))
+    return failures
+
+
+def summarize_test_run(counts: TestCounts | None, terminal: bool) -> str:
+    """The one-line digest, kept deliberately close to the old wording.
+
+    A missing terminal marker means the run was killed or truncated mid-suite;
+    "+N so far" would read as a finished suite, so that case stays opaque.
+    """
+    if counts is None:
+        return "all tests passed" if terminal else "see log"
+    passed = counts["passed"]
+    failed = counts["failed"]
+    skipped = counts["skipped"]
+    if failed:
         return f"{passed} passed, {failed} failed"
-    return "see log"
+    if not terminal:
+        return "see log"
+    return f"{passed} passed" + (f", {skipped} skipped" if skipped else "")
+
+
+def analyze_test_log(argv: list[str], log_path: str) -> TestLogDigest:
+    """Digest for `flutter test` / `dart test`, else an empty result.
+
+    The authoritative count comes from the last `+passed ~skipped -failed:`
+    progress line. The failure inventory comes from the `[E]` progress lines
+    rather than from the `Failing tests:` block, because that block lists at
+    most four entries and then "... and N more" (test_core caps it and sorts by
+    path, so a failure can be evicted by alphabet) — and the `failures-only`
+    reporter never writes it at all. The block is still read, but only to lend a
+    suite path to an entry that has none.
+
+    Returns {"summary", "counts", "failures"} where summary is the one-line
+    digest (None when this was not a test run), counts is
+    {"passed","skipped","failed"} from the last progress line, and failures is
+    [{"file","name","didNotComplete"}] in run order.
+    """
+    result: TestLogDigest = {"summary": None, "counts": None, "failures": []}
+    if not is_test_run(argv):
+        return result
+    failures: list[TestFailure] = []
+    block: list[TestFailure] = []
+    counts: TestCounts | None = None
+    terminal = False
+    in_block = False
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.rstrip("\n")
+                if in_block:
+                    stripped = line.strip()
+                    if TEST_BLOCK_MORE_RE.match(stripped):
+                        in_block = False
+                        continue
+                    if line.startswith("  ") and stripped:
+                        block.append(split_block_entry(stripped))
+                        continue
+                    in_block = False
+                if line == TEST_BLOCK_HEADER:
+                    in_block = True
+                    continue
+                match = TEST_FAILURE_RE.match(line)
+                if match:
+                    file, name = split_path_and_name(match.group("name"))
+                    failures.append(
+                        {
+                            "file": file,
+                            "name": name,
+                            "didNotComplete": bool(match.group("unfinished")),
+                        }
+                    )
+                    # No `continue`: the same line carries the running counts,
+                    # and on a killed run it may be the last one there is.
+                match = TEST_COUNTS_RE.match(line)
+                if match:
+                    counts = {
+                        "passed": int(match.group(1)),
+                        "skipped": int(match.group(2) or 0),
+                        "failed": int(match.group(3) or 0),
+                    }
+                # Checked last and without `continue`: the terminal markers ride
+                # on the very progress lines that carry the final counts.
+                if any(marker in line for marker in TEST_TERMINAL_MARKERS):
+                    terminal = True
+    except OSError:
+        return result
+
+    result["failures"] = attach_paths(failures, block)
+    result["counts"] = counts
+    result["summary"] = summarize_test_run(counts, terminal)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Sub-tools
+# ---------------------------------------------------------------------------
+
+
+def make_job_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment every spawned job gets.
+
+    UTF-8 regardless of the console code page, and no git credential or signing
+    prompt: this process has no terminal to answer one, so a prompt would cost
+    the whole job.
+    """
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    if extra:
+        env.update(extra)
+    return env
+
+
+def make_arb_edit_runner(
+    instructions: dict[str, object],
+    cwd: str,
+    launch_fn: Callable[[list[str]], tuple[list[str], dict[str, str]]] | None = None,
+    spawn: Callable[..., subprocess.Popen[bytes]] = subprocess.Popen,
+) -> Callable[[Job], None]:
+    """The worker-side body of an `arb-edit` job.
+
+    Order matters and is the whole point of the sub-tool: plan every file
+    before writing any, so an anchor missing from one file of the set leaves
+    the others byte-identical; then write; then run ``flutter gen-l10n`` through
+    ``resolve_launch`` (the SDK's own ``dart.exe``, so no ``.bat``/``cmd.exe``
+    parsing rides along) inside the single-worker queue, because gen-l10n writes
+    generated files into the project and must serialize against builds; then
+    read the untranslated-messages-file, which is a warning and not a failure.
+
+    ``launch_fn``/``spawn`` are injectable so the tests never start Flutter;
+    ``launch_fn=None`` means ``resolve_launch``, looked up when the job runs
+    (the definition lives further down this module).
+    """
+
+    def runner(job: Job) -> None:
+        resolve = launch_fn or resolve_launch
+        normalized = arb_edit_lib.validate_instructions(instructions)
+        groups = normalized["groups"]
+        dry_run = bool(normalized["dryRun"])
+        with open(job.log_path, "ab") as sink:
+
+            def say(line: str) -> None:
+                sink.write((line + "\n").encode("utf-8"))
+                sink.flush()
+
+            say(f"tool=arb-edit groups={len(groups)} dryRun={dry_run}")
+            if job.status == "killed":
+                return
+            try:
+                plan = arb_edit_lib.plan_arb_edits(Path(cwd), instructions)
+            except ValueError as error:
+                say(f"PLAN FAILED {error}")
+                job.error = str(error)
+                job.exit_code = 1
+                job.status = "failed"
+                return
+            result: dict[str, object] = {
+                "dryRun": dry_run,
+                "edited": [],
+                "skipped": plan["skipped"],
+                "changes": [
+                    {
+                        "file": entry["name"],
+                        "inserts": entry["inserts"],
+                        "deletes": entry["deletes"],
+                    }
+                    for entry in plan["files"]
+                ],
+                "genL10n": None,
+                "untranslated": None,
+            }
+            if dry_run:
+                # The plan phase is the whole job: nothing is written and
+                # gen-l10n does not run, which is what makes this usable to
+                # check anchors before mutating a project.
+                job.result = result
+                job.exit_code = 0
+                job.status = "done"
+                say(f"DRY RUN {len(plan['files'])} file(s) would be edited.")
+                return
+            if job.status == "killed":
+                return
+            result["edited"] = arb_edit_lib.apply_arb_edits(plan)
+            for name in result["edited"]:
+                say(f"Edited {name}")
+            say(f"{len(result['edited'])} ARB file(s) edited.")
+            if job.status == "killed":
+                # Killed between phases: the edits stand, and gen-l10n is not
+                # started at all.
+                job.result = result
+                return
+            say("Running flutter gen-l10n...")
+            try:
+                launch, extra_env = resolve(["flutter", "gen-l10n"])
+            except FileNotFoundError as error:
+                job.error = str(error)
+                job.exit_code = 127
+                job.status = "failed"
+                job.result = result
+                return
+            job.resolved = launch
+            process = spawn(
+                launch,
+                cwd=cwd,
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                env=make_job_env(extra_env),
+                creationflags=CREATE_NO_WINDOW,
+            )
+            job.set_process(process)
+            exit_code = process.wait()
+            job.exit_code = exit_code
+            result["genL10n"] = {"exitCode": exit_code}
+            result["untranslated"] = arb_edit_lib.read_untranslated(
+                plan["untranslated_file"]
+            )
+            job.result = result
+            if job.status != "killed":
+                job.status = "done" if exit_code == 0 else "failed"
+            untranslated = result["untranslated"]
+            if isinstance(untranslated, dict):
+                say(
+                    "WARNING untranslated-messages-file has "
+                    f"{untranslated['lines']} line(s) of untranslated messages."
+                )
+
+    return runner
+
+
+def make_tool_runner(
+    name: str, body: dict[str, object], cwd: str
+) -> Callable[[Job], None]:
+    """The runner for a registered sub-tool. Raises KeyError if unknown."""
+    if name == "arb-edit":
+        return make_arb_edit_runner(body, cwd)
+    raise KeyError(name)
+
+
+def tool_display_argv(name: str, instruction: dict[str, object]) -> list[str]:
+    """What the status page shows for a sub-tool job."""
+    if name == "arb-edit":
+        groups = instruction.get("groups")
+        count = len(groups) if isinstance(groups, list) else 0
+        display = [f"tool:{name}", f"{count} group(s)"]
+        if instruction.get("dryRun"):
+            display.append("--dry-run")
+        return display
+    return [f"tool:{name}"]
+
+
+def split_tool_body(body: dict[str, object]) -> dict[str, object]:
+    """The sub-tool instruction inside a request body.
+
+    The route's transport knobs (`wait`, `timeoutSec`, `grep`, `tail`) are the
+    bridge's, not the sub-tool's, so they are removed before the instruction
+    schema is checked — `/run` makes the same distinction between a command's
+    argv and the knobs that shape the response.
+    """
+    return {
+        key: value
+        for key, value in body.items()
+        if key not in TOOL_TRANSPORT_FIELDS
+    }
 
 
 class ToolHub:
@@ -255,11 +788,34 @@ class ToolHub:
 
     # ---- submission ----
 
-    def submit(self, cmd: str, args: list[str]) -> Job:
-        argv = [cmd, *args]
+    def submit(self, cmd: str, args: list[str], message: str | None = None) -> Job:
+        argv = build_argv(cmd, args, message)
         validate(argv)
+        return self._enqueue(
+            Job(argv, self.cwd, os.path.join(self.log_dir, "pending.log"))
+        )
+
+    def submit_tool(
+        self,
+        name: str,
+        display_argv: list[str],
+        runner: Callable[[Job], None],
+    ) -> Job:
+        """Queues a sub-tool job. Raises KeyError for an unregistered name."""
+        if name not in TOOL_NAMES:
+            raise KeyError(name)
+        return self._enqueue(
+            Job(
+                display_argv,
+                self.cwd,
+                os.path.join(self.log_dir, "pending.log"),
+                runner=runner,
+            )
+        )
+
+    def _enqueue(self, job: Job) -> Job:
+        """Registers a job, creates its log and hands it to the worker."""
         with self._lock:
-            job = Job(argv, self.cwd, os.path.join(self.log_dir, "pending.log"))
             job.log_path = os.path.join(self.log_dir, f"{job.id}.log")
             # index order: newest last
             self.jobs[job.id] = job
@@ -312,9 +868,24 @@ class ToolHub:
         self._current = job
         job.status = "running"
         job.started_at = time.time()
-        env = dict(os.environ)
-        env["PYTHONIOENCODING"] = "utf-8"
-        env["PYTHONUTF8"] = "1"
+        try:
+            if job.runner is None:
+                self._run_command(job)
+            else:
+                # Sub-tools run here, on the worker thread, for the same reason
+                # commands are serialized: gen-l10n writes into the project.
+                job.runner(job)
+        except Exception as error:  # noqa: BLE001 - a job error must not kill the worker
+            job.status = "failed"
+            if job.exit_code is None:
+                job.exit_code = 1
+            job.error = str(error)
+        finally:
+            job.finished_at = time.time()
+            self._current = None
+
+    def _run_command(self, job: Job) -> None:
+        env = make_job_env()
         try:
             launch, extra_env = resolve_launch(job.argv)
         except FileNotFoundError as error:
@@ -323,8 +894,6 @@ class ToolHub:
             job.error = str(error)
             with open(job.log_path, "ab") as sink:
                 sink.write((job.error + "\n").encode("utf-8"))
-            job.finished_at = time.time()
-            self._current = None
             return
         job.resolved = launch
         env.update(extra_env)
@@ -346,20 +915,16 @@ class ToolHub:
             job.exit_code = exit_code
             if job.status != "killed":
                 job.status = "done" if exit_code == 0 else "failed"
-            job.summary = parse_summary(job.argv, job.log_path)
+            digest = analyze_test_log(job.argv, job.log_path)
+            job.summary = digest["summary"]
+            job.counts = digest["counts"]
+            job.failures = digest["failures"]
         except FileNotFoundError:
             job.status = "failed"
             job.exit_code = 127
             job.error = f"executable not found: {job.argv[0]}"
             with open(job.log_path, "ab") as sink:
                 sink.write((job.error + "\n").encode("utf-8"))
-        except Exception as error:  # noqa: BLE001 - a job error must not kill the worker
-            job.status = "failed"
-            job.exit_code = 1
-            job.error = str(error)
-        finally:
-            job.finished_at = time.time()
-            self._current = None
 
     # ---- shutdown ----
 
@@ -418,44 +983,175 @@ def resolve_launch(argv: list[str]) -> tuple[list[str], dict[str, str]]:
     return ([exe, *argv[1:]], {})
 
 
+def command_name(cmd: str) -> str:
+    """The bare tool name behind a path or a Windows wrapper suffix."""
+    exe = os.path.basename(cmd).lower()
+    if exe.endswith((".bat", ".exe", ".cmd")):
+        exe = exe.rsplit(".", 1)[0]
+    return exe
+
+
 def validate(argv: list[str]) -> None:
     """Refuses anything outside the documented surface. Raises ValueError."""
-    exe = os.path.basename(argv[0]).lower()
-    if exe.endswith(".bat") or exe.endswith(".exe") or exe.endswith(".cmd"):
-        exe = exe.rsplit(".", 1)[0]
+    exe = command_name(argv[0])
     if exe not in ALLOWED_EXES:
         raise ValueError(
             f"command not allowed: {argv[0]!r} (allowed: {sorted(ALLOWED_EXES)})"
         )
-    if exe == "git":
-        args = argv[1:]
-        if not args:
-            raise ValueError("git needs a verb")
-        verb = args[0]
-        if verb.startswith("-"):
-            # `git --version` and friends carry no repository risk, but keep the
-            # surface honest: only the documented verbs.
-            raise ValueError(f"git verb not allowed: {verb!r}")
-        if verb not in GIT_VERBS:
+    if exe != "git":
+        return
+    args = argv[1:]
+    if not args:
+        raise ValueError("git needs a verb")
+    verb = args[0]
+    if verb.startswith("-"):
+        # `git --version` and friends carry no repository risk, but keep the
+        # surface honest: only the documented verbs.
+        raise ValueError(f"git verb not allowed: {verb!r}")
+    if verb not in GIT_VERBS:
+        raise ValueError(verb_refusal(verb))
+    body = args[1:]
+    allowed = GIT_ALLOWED_FLAGS.get(verb)
+    if allowed is not None:
+        validate_restore(body, allowed)
+        return
+    blocked = GIT_BLOCKED_FLAGS.get(verb, set())
+    for arg in body:
+        if arg in blocked:
+            raise ValueError(f"git {verb} flag not allowed: {arg!r}")
+    if verb == "commit" and not has_message_source(body):
+        raise ValueError(
+            "git commit needs a message: pass the inline 'message' field to "
+            "/run, or one of -m/--message/-F/--file/-C/--reuse-message"
+        )
+
+
+def verb_refusal(verb: str) -> str:
+    """The refusal for an unknown git verb, with the substitute when there is one."""
+    message = f"git verb not allowed: {verb!r} (allowed: {sorted(GIT_VERBS)})"
+    if verb in ("checkout", "switch"):
+        message += (
+            " — to discard worktree changes to named paths, use 'git restore -- <path>'"
+        )
+    return message
+
+
+def flag_allowed(token: str, allowed: set[str]) -> bool:
+    """Whether a flag token sets only allow-listed flags.
+
+    `--no-X` is the same surface as `--X` (so it is canonicalised), and a short
+    cluster like `-SW`/`-SWq` sets each letter, so each one must be allowed.
+    """
+    if token.startswith("--"):
+        return "--" + token[2:].removeprefix("no-") in allowed
+    if len(token) > 2:
+        return all("-" + char in allowed for char in token[1:])
+    return token in allowed
+
+
+def guard_restore_pathspec(spec: str) -> None:
+    """Refuses any pathspec that is not a literal path inside the worktree.
+
+    `git restore` discards uncommitted work irrecoverably, so the only shape
+    this bridge accepts is "these named files, please": no pathspec magic, no
+    globs, no absolute paths, no `..`, and no bare `.` (which is the whole
+    worktree). Raises ValueError.
+    """
+    if not spec:
+        raise ValueError("git restore pathspec must not be empty")
+    if spec.startswith(":"):
+        raise ValueError(f"git restore pathspec magic is not allowed: {spec!r}")
+    if os.path.isabs(spec) or os.path.splitdrive(spec)[0]:
+        raise ValueError(f"git restore pathspec must be relative: {spec!r}")
+    if spec[0] in "/\\":
+        # `os.path.isabs` is False for a rooted path on Windows; git would
+        # still resolve it against the drive, so refuse it explicitly.
+        raise ValueError(f"git restore pathspec must be relative: {spec!r}")
+    wildcard = sorted(set(spec) & PATHSPEC_WILDCARDS)
+    if wildcard:
+        raise ValueError(
+            "git restore pathspec must name files, not a pattern: "
+            f"{spec!r} contains {''.join(wildcard)!r}"
+        )
+    parts = [part for part in re.split(r"[\\/]", spec) if part not in ("", ".")]
+    if not parts or ".." in parts:
+        raise ValueError(
+            "git restore pathspec must name files inside the working "
+            f"directory: {spec!r}"
+        )
+
+
+def validate_restore(args: list[str], allowed: set[str]) -> None:
+    """The `restore` surface: an allow-listed flag set and literal pathspecs."""
+    pathspecs: list[str] = []
+    after_separator = False
+    for token in args:
+        if after_separator:
+            pathspecs.append(token)
+            continue
+        if token == "--":
+            after_separator = True
+            continue
+        if token.startswith("-"):
+            if not flag_allowed(token, allowed):
+                raise ValueError(f"git restore flag not allowed: {token!r}")
+            continue
+        pathspecs.append(token)
+    if not pathspecs:
+        raise ValueError(
+            "git restore needs at least one explicit path, e.g."
+            " git restore -- lib/main.dart"
+        )
+    for spec in pathspecs:
+        guard_restore_pathspec(spec)
+
+
+def has_message_source(args: list[str]) -> bool:
+    """Whether a `git commit` argv already carries a message."""
+    for token in args:
+        head = token.split("=", 1)[0]
+        if head in MESSAGE_SOURCE_FLAGS:
+            return True
+    return False
+
+
+def build_argv(cmd: str, args: list[str], message: str | None) -> list[str]:
+    """Assembles the argv, folding an inline commit message in as `-m <text>`.
+
+    `-m` rather than a temp file or stdin: no file exists for a later
+    `git add -A` to sweep up (the incident this closes), nothing to clean up,
+    and no pipe to deadlock on. The message therefore travels as argv — UTF-8
+    through JSON, never through a shell or a pwsh `Set-Content`. Raises
+    ValueError.
+    """
+    if message is None:
+        return [cmd, *args]
+    if not isinstance(message, str):
+        raise ValueError("'message' must be a string")
+    if not message.strip():
+        raise ValueError("'message' must not be empty")
+    if command_name(cmd) != "git" or not args or args[0] != "commit":
+        raise ValueError("'message' is only valid for git commit")
+    body = args[1:]
+    for token in body:
+        if token.split("=", 1)[0] in MESSAGE_SOURCE_FLAGS:
             raise ValueError(
-                f"git verb not allowed: {verb!r} (allowed: {sorted(GIT_VERBS)})"
+                f"pass the commit message either inline or as {token!r}, not both"
             )
-        blocked = GIT_BLOCKED_FLAGS.get(verb, set())
-        for arg in args[1:]:
-            if arg in blocked:
-                raise ValueError(f"git {verb} flag not allowed: {arg!r}")
+    return [cmd, "commit", "-m", message, *body]
 
 
 def make_handler(hub: ToolHub, token: str, status_url: str):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "toolhub/1.0"
+        server_version = "toolhub/1.1"
         protocol_version = "HTTP/1.1"
 
         # ---- plumbing ----
 
-        def log_message(self, fmt: str, *args: object) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             # The harness reads stdout for lifecycle lines only; per-request
-            # noise would drown them.
+            # noise would drown them. (The parameter is named `format` because
+            # that is `BaseHTTPRequestHandler`'s own name for it.)
             return
 
         def _send(self, status: int, body: bytes, content_type: str) -> None:
@@ -501,12 +1197,66 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                 raise ValueError("body must be a JSON object")
             return parsed
 
+        def _discard_body(self) -> None:
+            """Reads and drops a body the handler is not going to parse.
+
+            An early return that answers before the body is consumed (a 401, or
+            the 404 for an unknown tool) leaves unread bytes in the socket, and
+            Windows answers that by resetting the connection — the caller sees
+            a connection abort instead of the error it is owed. Only call this
+            where the body has *not* been read: reading it twice would block
+            forever on bytes that are already gone.
+            """
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0:
+                return
+            try:
+                self.rfile.read(length)
+            except OSError:
+                pass
+
+        def _await_and_send(
+            self,
+            job: Job,
+            body: dict[str, object],
+            tail: int,
+            grep: re.Pattern[str] | None,
+        ) -> None:
+            """Shared tail of `/run` and `/tools/<name>`: wait, then answer.
+
+            `wait` blocks for queue time *plus* run time, bounded by
+            `timeoutSec`; when that expires the job keeps running and is
+            fetched later by id. Same contract for both routes on purpose — a
+            sub-tool is a job, so nothing about this changes for one.
+            """
+            if body.get("wait"):
+                timeout = body.get("timeoutSec")
+                deadline = (
+                    time.time() + float(timeout)
+                    if isinstance(timeout, (int, float)) and timeout
+                    else None
+                )
+                while job.status in ("queued", "running"):
+                    if deadline is not None and time.time() > deadline:
+                        break
+                    time.sleep(0.2)
+            self._json(
+                200,
+                {
+                    **job.to_json(tail_lines=tail, grep=grep),
+                    "aheadOf": hub.ahead_of(job.id),
+                },
+            )
+
         # ---- routes ----
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             path = self.path.split("?", 1)[0]
             if path == "/health":
-                self._json(200, {"ok": True})
+                # `tools` is the capability probe a client uses before calling a
+                # sub-tool route: a bridge deployed before this one answers with
+                # just {"ok": true}.
+                self._json(200, {"ok": True, "tools": list(TOOL_NAMES)})
                 return
             if path == "/":
                 if not self._authorized():
@@ -533,15 +1283,17 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                 if job is None:
                     self._error(404, "no such job")
                     return
-                tail = DEFAULT_TAIL_LINES
-                query = self.path.split("?", 1)[1] if "?" in self.path else ""
-                for part in query.split("&"):
-                    if part.startswith("tail="):
-                        try:
-                            tail = max(0, min(5000, int(part[5:])))
-                        except ValueError:
-                            pass
-                self._json(200, job.to_json(tail_lines=tail))
+                query = urllib.parse.parse_qs(
+                    self.path.split("?", 1)[1] if "?" in self.path else ""
+                )
+                try:
+                    tail, grep = parse_log_query(
+                        one(query.get("grep")), one(query.get("tail"))
+                    )
+                except ValueError as error:
+                    self._error(400, str(error))
+                    return
+                self._json(200, job.to_json(tail_lines=tail, grep=grep))
                 return
             match = re.fullmatch(r"/jobs/([0-9a-f]+)/log", path)
             if match:
@@ -561,6 +1313,7 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             path = self.path.split("?", 1)[0]
             if not self._authorized():
+                self._discard_body()
                 self._error(401, "missing or bad token")
                 return
             if path == "/run":
@@ -579,29 +1332,57 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                 ):
                     self._error(400, "args must be a list of strings")
                     return
+                message = body.get("message")
+                if message is not None and not isinstance(message, str):
+                    self._error(400, "message must be a string")
+                    return
                 try:
-                    job = hub.submit(cmd, list(args))
+                    tail, grep = parse_log_query(body.get("grep"), body.get("tail"))
+                except ValueError as error:
+                    self._error(400, str(error))
+                    return
+                try:
+                    job = hub.submit(cmd, list(args), message=message)
                 except ValueError as error:
                     self._error(403, str(error))
                     return
-                if body.get("wait"):
-                    timeout = body.get("timeoutSec")
-                    deadline = (
-                        time.time() + float(timeout)
-                        if isinstance(timeout, (int, float)) and timeout
-                        else None
+                self._await_and_send(job, body, tail, grep)
+                return
+            match = re.fullmatch(r"/tools/([a-z0-9][a-z0-9-]*)", path)
+            if match:
+                name = match.group(1)
+                if name not in TOOL_NAMES:
+                    self._discard_body()
+                    self._error(
+                        404,
+                        f"no such tool: {name} "
+                        f"(available: {', '.join(TOOL_NAMES)})",
                     )
-                    while job.status in ("queued", "running"):
-                        if deadline is not None and time.time() > deadline:
-                            break
-                        time.sleep(0.2)
-                self._json(
-                    200,
-                    {
-                        **job.to_json(tail_lines=DEFAULT_TAIL_LINES),
-                        "aheadOf": hub.ahead_of(job.id),
-                    },
+                    return
+                try:
+                    body = self._body()
+                except ValueError as error:
+                    self._error(400, str(error))
+                    return
+                instruction = split_tool_body(body)
+                try:
+                    # The route's 400 layer: everything checkable without the
+                    # filesystem, so a schema typo never costs a queued job.
+                    arb_edit_lib.validate_instructions(instruction)
+                except ValueError as error:
+                    self._error(400, str(error))
+                    return
+                try:
+                    tail, grep = parse_log_query(body.get("grep"), body.get("tail"))
+                except ValueError as error:
+                    self._error(400, str(error))
+                    return
+                job = hub.submit_tool(
+                    name,
+                    tool_display_argv(name, instruction),
+                    make_tool_runner(name, instruction, hub.cwd),
                 )
+                self._await_and_send(job, body, tail, grep)
                 return
             match = re.fullmatch(r"/jobs/([0-9a-f]+)/kill", path)
             if match:
@@ -751,6 +1532,7 @@ def selfcheck(timeout: float) -> bool:
         return False
     env = dict(os.environ)
     env.update(extra_env)
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         completed = subprocess.run(  # noqa: S603 - argv list, no shell
             launch,

@@ -1,0 +1,9 @@
+00:05 +10 -1: a test whose name carries no path [E]
+  Expected: 1
+    Actual: 2
+  
+00:06 +12 -2: another pathless failure [E]
+  Expected: 'a'
+    Actual: 'b'
+  
+00:06 +12 -2: Some tests failed.

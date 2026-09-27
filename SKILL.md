@@ -1,6 +1,6 @@
 ---
 name: tool-bridge
-description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build) or a git write (add, commit) is needed. Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command.
+description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build), a git write (add, commit, restore), or a Flutter ARB localization edit is needed. Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command.
 ---
 
 <what-to-do>
@@ -8,7 +8,10 @@ description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain co
 Source of truth: `D:\Projects\dsh-tool-bridge` (a git repository). DSH discovers
 and loads the deployed copy at `~\.dsh\skills\tool-bridge`, so below `<skill>`
 means that deployed directory. Edit the repository, then deploy with
-`python scripts/sync_to_skills.py` — it copies everything except `.git`.
+`python scripts/sync_to_skills.py` — it copies `SKILL.md` and `scripts/`, and
+deliberately skips `CONTEXT.md`, `docs/` and `tests/` so the global skill carries
+no documentation. The repository's `CONTEXT.md` (vocabulary) and `docs/adr/`
+(decisions) are worth reading from the repo when a rule here looks arbitrary.
 
 Use this whenever a toolchain command would otherwise need a one-shot
 `danger-full-access` escalation. In the DSH file sandbox (`workspace-write`),
@@ -74,7 +77,19 @@ function Invoke-Run([string]$exe,[string[]]$cmdArgs,[int]$timeout=900){
 }
 $r = Invoke-Run 'flutter' @('test','test/core/services/sync')
 "$($r.status) exit=$($r.exitCode) $($r.durationSec)s $($r.summary)"
-$r.tail      # last 200 log lines, UTF-8
+$r.failures   # [{"file","name","didNotComplete"}] — complete, in run order
+$r.tail       # last 200 log lines, UTF-8
+```
+
+Filter the log server-side instead of pulling noise back and grepping it by
+hand — `grep` selects lines, `tail` caps how many are returned:
+
+```powershell
+$body=@{cmd='flutter';args=@('test','test/features');wait=$true;timeoutSec=900;
+  grep='\[E\]|Failing tests|Expected|Actual';tail=80}|ConvertTo-Json -Compress
+$r = Invoke-RestMethod "http://127.0.0.1:$port/run" -Method Post -Headers $h -Body $body -TimeoutSec 1000
+$r.log        # {grep, matched, returned, scannedLines, truncated}
+$r.tail       # the last 80 matching lines
 ```
 
 **Two PowerShell traps in these helpers**, both of which produce a misleading
@@ -86,7 +101,75 @@ $r.tail      # last 200 log lines, UTF-8
   is parsed as a variable named `id?tail`, mangling the URL into a 404. Use a
   subexpression: `".../jobs/$($id)?tail=5"`.
 
-## 3. Stop it
+## 3. Caller timeouts (the queue is not free)
+
+`wait:true` blocks for **queue time plus run time**, and `timeoutSec` bounds that
+whole wait — not just the execution. When it expires the server returns the job
+as it stands (`status: "queued"` or `"running"`, plus `aheadOf`) and lets it keep
+running; nothing is killed.
+
+So the budgets must nest:
+
+- **HTTP client timeout > `timeoutSec`.** In the helper above that is
+  `-TimeoutSec ($timeout+30)`.
+- **Harness tool timeout > HTTP client timeout.** A pwsh tool call defaults to
+  about 120 s, which `timeoutSec=900` can never reach: the call dies first and
+  the job becomes unreachable **until you look it up**, which is the next point.
+- For anything that may exceed ~100 s, either pass an explicit `timeoutMs` with
+  generous slack, or use `wait:false` and poll:
+
+```powershell
+$body=@{cmd='dart';args=@('analyze','lib','test');wait=$false}|ConvertTo-Json -Compress
+$job = Invoke-RestMethod "http://127.0.0.1:$port/run" -Method Post -Headers $h -Body $body
+"queued behind $($job.aheadOf)"
+$j = Invoke-RestMethod "http://127.0.0.1:$port/jobs/$($job.id)?tail=20" -Headers $h
+```
+
+**Recovery after a caller-side timeout**: the job survives, so fetch it by id
+with `GET /jobs/<id>?tail=N&grep=P` — including the digest, since the failure
+inventory rides with the log view. `/jobs` lists everything with `summary` and
+`counts` but no logs or failure lists, so it stays cheap to read.
+
+## 4. Edit ARB localization files (sub-tool)
+
+`flutter gen-l10n` cannot run confined, which used to make an ARB edit cost a
+second escalation. It is a bridge **sub-tool** now: the edit, the gen-l10n run
+and the untranslated-messages check all happen in the pinned cwd, on the same
+single worker that serializes builds.
+
+```powershell
+$instr = @{ groups = @(
+  @{ insertAfter = 'chatMessageWidgetSpeak'; newFields = @(
+     @{ key = 'lanSyncSectionTitle'; value = @{
+          'app_en.arb'      = 'LAN Sync'
+          'app_zh.arb'      = '局域网同步'
+          'app_zh_Hans.arb' = '局域网同步'
+          'app_zh_Hant.arb' = '區域網路同步' } } ) } ) }
+$body = @{ groups = $instr.groups; wait = $true; timeoutSec = 300 } |
+        ConvertTo-Json -Depth 10 -Compress
+$r = Invoke-RestMethod "http://127.0.0.1:$port/tools/arb-edit" -Method Post `
+       -Headers $h -Body $body -TimeoutSec 400
+$r.result.edited        # files written
+$r.result.changes       # per file: inserted / deleted key names
+$r.result.genL10n       # {"exitCode": 0}
+$r.result.untranslated  # null, or {file, lines, content} — a warning, not a failure
+```
+
+- **Check the anchors first**: add `dryRun = $true`. The reply lists exactly what
+  would change and nothing is written.
+- The body is UTF-8 JSON, so CJK values need no console code-page games, and no
+  instruction file is ever created.
+- **There is no `cwd` field** — the bridge pins the project directory at boot, so
+  a `cwd` in the body is a `400`. Edit another project by starting a bridge with
+  `--cwd <project>` (a second bridge is fine; it is one escalation, and only if
+  the toolchain needs one at all).
+- `$r.result.genL10n.exitCode != 0` means the edits **were** written and gen-l10n
+  then failed: read `$r.tail`, fix the ARB, and re-post.
+- The schema and the pitfalls are under "Sub-tool: arb-edit" in the reference
+  below. Run `/health` first if you are unsure whether the deployed bridge has
+  this sub-tool: it reports `tools`.
+
+## 5. Stop it
 
 `POST /stop` when work is done (`Invoke-RestMethod ".../stop" -Method Post
 -Headers $h`). If it is left running, the parent watchdog ends it when the
@@ -101,11 +184,12 @@ session binds a new random port.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | liveness; no token |
+| GET | `/health` | liveness + `tools` (the sub-tools this bridge supports); no token |
 | GET | `/?token=…` | human status page: job list + live log tail (browser-friendly; opened automatically at boot) |
-| POST | `/run` | `{"cmd","args","wait","timeoutSec"}` → job; `wait:true` blocks until done |
-| GET | `/jobs` | all jobs, newest last |
-| GET | `/jobs/<id>?tail=N` | one job + last N log lines (default 200) |
+| POST | `/run` | `{"cmd","args","message","wait","timeoutSec","grep","tail"}` → job; `wait:true` blocks until done |
+| POST | `/tools/arb-edit` | `{"groups","dryRun","wait","timeoutSec","grep","tail"}` → job with a structured `result` |
+| GET | `/jobs` | all jobs, newest last (no logs, no failure lists) |
+| GET | `/jobs/<id>?tail=N&grep=P` | one job + last N log lines (default 200), or the last N lines matching the `P` regex |
 | GET | `/jobs/<id>/log` | full raw log (UTF-8) |
 | POST | `/jobs/<id>/kill` | kill that job's process tree |
 | POST | `/stop` | kill children and exit |
@@ -113,27 +197,193 @@ session binds a new random port.
 All but `/health` require `Authorization: Bearer <token>` (the status page may
 pass `?token=` instead, since a browser cannot set headers).
 
-Job JSON: `id, argv, resolvedArgv, status (queued|running|done|failed|killed),
-exitCode, startedAt, finishedAt, durationSec, summary, error, logPath, tail`.
+Job JSON: `id, kind (cmd|tool), argv, resolvedArgv, status
+(queued|running|done|failed|killed), exitCode, startedAt, finishedAt,
+durationSec, summary, counts, error, result, logPath`, plus `tail`, `log` and
+`failures` whenever the response carries a log view.
 
-`summary` is parsed for `flutter test` (`33 passed`, `32 passed, 1 failed`) —
-the quick answer that a ten-minute suite otherwise buries in the tail.
+### Sub-tool: arb-edit
 
-## What it will and will not run
+`POST /tools/arb-edit` applies ARB edits, runs `flutter gen-l10n` and reports the
+untranslated-messages-file. It is a Job like any other (ADR-0003): it queues
+behind a running build, it is killed by `/jobs/<id>/kill`, and its log is the
+raw combined output of the edit report plus gen-l10n. `argv` is a display line
+(`["tool:arb-edit", "2 group(s)"]`); `resolvedArgv` is the gen-l10n launch that
+actually ran.
+
+Request body:
+
+```json
+{
+  "dryRun": false,
+  "groups": [
+    {
+      "insertAfter": "someExistingKey",
+      "deleteFrom": "firstKeyToDelete",
+      "deleteTo": "lastKeyToDelete",
+      "newFields": [
+        {
+          "key": "newKeyName",
+          "value": {
+            "app_en.arb": "English Value",
+            "app_zh.arb": "中文值",
+            "app_zh_Hans.arb": "简体中文值",
+            "app_zh_Hant.arb": "繁體中文值"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+- **`groups`** (required): one or more edit groups, applied in order.
+  - **`insertAfter`**: the key to insert after, or `__END__` for the end of the
+    file. Required when `newFields` is non-empty. If the anchor owns an `@key`
+    metadata block, the new entries go after the block, so it stays attached.
+  - **`deleteFrom` / `deleteTo`**: an **inclusive** key range to delete first;
+    both or neither. An `@key` block following `deleteTo` is deleted with it.
+    The range applies to every file the group touches, so a key that only some
+    files have fails the whole plan (nothing written) — name the files
+    explicitly with `newFields` when the key is not universal.
+  - **`newFields`**: `key` plus a map of ARB file name → translated string.
+    Only the named files are touched. **Omit `newFields` entirely** (or send an
+    empty list) for a pure delete: that applies to every `app_*.arb` in the
+    configured arb-dir. A group with neither `newFields` nor a
+    `deleteFrom`/`deleteTo` range is refused — it would do no work while
+    rewriting every ARB file and running gen-l10n for nothing.
+  - Keys starting with `@` are refused: gen-l10n generates `@key` metadata from
+    the template ARB file, and a hand-written string value is not a Map.
+- **`dryRun`**: plan only — no file is written and gen-l10n does not run.
+
+`result`:
+
+```json
+{
+  "dryRun": false,
+  "edited": ["app_en.arb", "app_zh.arb"],
+  "skipped": [{"file": "app_xx.arb", "reason": "not found"}],
+  "changes": [{"file": "app_en.arb", "inserts": ["newKeyName"], "deletes": []}],
+  "genL10n": {"exitCode": 0},
+  "untranslated": {"file": "desiredFileName.txt", "lines": 3, "content": "..."}
+}
+```
+
+- Line endings are preserved per file (CRLF stays CRLF) and values are written
+  as raw UTF-8, never `\uXXXX`-escaped.
+- **Plan before write**: every target file is planned in memory first, so a
+  missing anchor means `status: "failed"` with `error` naming the file and key,
+  and **zero** files touched.
+- `genL10n.exitCode != 0` fails the job but the edits stand; `edited` and
+  `changes` still say what was written, so fix the ARB and re-post.
+- `untranslated` is non-null only when the configured
+  `untranslated-messages-file` exists with real content — a warning, never a
+  failure. A missing or `{}` file counts as no untranslated messages.
+- `skipped` lists ARB files named in a value map that do not exist on disk;
+  they are not created.
+- ARB files are only edited; the generated Dart is gen-l10n's business.
+
+### Reading a job's output
+
+- **`tail`** — the log lines returned: `/run` defaults to 200, `/jobs/<id>` to
+  200, both capped at 5000 and both accepting `0`.
+- **`grep`** — an optional case-sensitive Python regex; only matching lines are
+  eligible, and `tail` then caps how many are returned. An invalid pattern is a
+  `400`. With `grep` the whole log is scanned (without it, only the last 256 KiB
+  is read), and the response's **`log`** object reports `matched`, `returned`,
+  `scannedLines` and `truncated` — so `matched: 0` is "no such line", never
+  "no output".
+- The raw log is never rewritten; `/jobs/<id>/log` and the status page stay
+  unfiltered.
+
+### Reading a test result
+
+`summary` is the one-line digest (`83 passed, 4 failed`); `counts` is
+`{passed, skipped, failed}` from the last progress line; `failures` is the
+**complete** failure inventory in run order:
+
+```json
+[{"file": "C:/ws/test/desktop/alpha_test.dart", "name": "alpha refuses a bad key", "didNotComplete": false}]
+```
+
+Where it comes from matters when it looks thin:
+
+- `failures` is built from the `[E]` progress lines, **not** from the reporter's
+  `Failing tests:` block: that block lists at most four entries (then
+  `... and N more`) sorted by path, so a failure of yours can be evicted by
+  alphabet. The block is used only to lend a suite path to an entry that has
+  none — `file` is `null` for a single-file run, where the reporter prints no
+  path at all.
+- `counts.failed` is authoritative; if it exceeds `len(failures)`, the log was
+  written by a reporter whose failure lines this parser does not recognise.
+- Under `-r json` or `-r silent` there are no progress lines: `failures` is `[]`
+  and `summary` is `see log`. A load/compile failure appears as an entry whose
+  `name` starts with `loading `.
+- No terminal marker (`All tests passed!` / `Some tests failed.`) means the run
+  was killed or truncated, and `summary` stays `see log` rather than claiming a
+  count that is only "so far".
+
+**Two reporter flags are worth knowing about** (both are `flutter test` flags,
+so they go in `args`):
+
+- `--reporter=failures-only` — one line per failure, no per-test progress lines.
+  The counts, `[E]` lines and `summary` survive; the `Failing tests:` block does
+  not (by design, above). It still echoes test `print()` output, which is where
+  repeated warnings come from.
+- `--file-reporter=json:<path-relative-to-cwd>` — an additional machine-readable
+  JSONL result file. Because it is written by the job in the pinned cwd, it lands
+  inside the workspace and the confined agent can read it directly with the
+  normal file tools; use it when you need ids, timings, or a second opinion on
+  the inventory.
+
+## Git: what it will and will not run
 
 - `flutter` and `dart`: any subcommand, any arguments.
-- `git`: only `status`, `diff`, `log`, `add`, `commit`, `branch` — and
-  `branch` refuses `-d/-D/--delete/-m/-M/--move`.
+- `git`: only `status`, `diff`, `log`, `add`, `commit`, `branch`, `restore` —
+  and `branch` refuses `-d/-D/--delete/-m/-M/--move`.
 - Nothing else. **No `git push`** (the GitHub token must never live in a
   long-running process — keep using the documented inline-token recipe), no
-  `reset`/`clean`/`checkout`/`restore`, no arbitrary executables.
+  `reset`/`clean`/`checkout`/`switch`/`stash` in any form. A `checkout` refusal
+  names its substitute: `git restore -- <path>`.
+- **`restore` is path-scoped on purpose.** It accepts only literal, relative,
+  non-wildcard paths — no `.`, no `..`, no `:` pathspec magic, no `*.dart`, no
+  absolute path, no `--pathspec-from-file` — plus the flags `--staged`/`-S`,
+  `--worktree`/`-W` and `--quiet`/`-q`. So `git restore -- <paths>` is the way to
+  undo a formatter's spill-over, and the whole-worktree wipe is out of reach.
+  Typical uses:
+  - discard worktree edits to named files: `git restore -- lib/a.dart lib/b.dart`
+  - also unstage them (index and worktree back to HEAD): `git restore -S -W -- lib/a.dart`
+  - unstage only: `git restore --staged -- lib/a.dart`
+  Files that are *untracked* cannot be restored — `clean` is deliberately absent,
+  so remove them yourself.
+- **`commit` needs a message**, either inline (below) or via
+  `-m/--message/-F/--file/-C/--reuse-message`. A bare `git commit` is refused
+  instead of failing inside git with an editor error.
+
+### Committing with an inline message
+
+Pass `message` on `/run` and never write a message file:
+
+```powershell
+$body=@{cmd='git';args=@('commit','--amend');message="slice 2: 中文 subject`n`nbody"}|ConvertTo-Json -Compress
+$r = Invoke-RestMethod "http://127.0.0.1:$port/run" -Method Post -Headers $h -Body $body
+```
+
+The server folds it into argv as `-m <text>`, which is why the message travels as
+UTF-8 through JSON rather than through pwsh's file writing, and why no file ever
+exists for a later `git add -A` to sweep into the commit. `message` is accepted
+only with `commit`, is refused beside another message flag, and must be a
+non-empty string; a non-string is a `400`, the rest are `403`. It is echoed in
+the job JSON (the human's status page shows it) and is subject to the ~32 KB
+Windows command-line limit.
 
 Arguments always travel as an argv list to `subprocess.Popen` — there is no
 shell anywhere. On Windows `flutter`/`dart` are `.bat` wrappers that
 CreateProcess cannot execute, so the server launches the SDK's own
 `dart.exe` (+ `flutter_tools.snapshot`) directly, which is also what keeps
 `cmd.exe` and its parsing rules out of the path; `resolvedArgv` shows what
-actually ran.
+actually ran. Git jobs run with `GIT_TERMINAL_PROMPT=0`, so nothing can block on
+a credential or signing prompt that this process has no terminal to answer.
 
 Jobs run **one at a time** on purpose: concurrent Flutter invocations fight
 over `build/` (a locked `build/native_assets/windows/sqlite3.dll` has already
@@ -141,13 +391,34 @@ broken a run). `POST /run` therefore queues behind whatever is running, and the
 response reports `aheadOf` — how many unfinished jobs are in front of yours,
 counting the one that is currently running.
 
+## Baseline attribution: "is this failure mine?"
+
+To re-run a test without your uncommitted changes, use only what the bridge
+already allows — writes inside the workspace are permitted, so:
+
+1. Copy the dirty files somewhere inside the workspace, e.g.
+   `mkdir .baseline-backup` then copy each modified file there.
+2. `git restore -- <those paths>` to put the committed versions back.
+3. Run the job again through the bridge.
+4. Copy your files back from `.baseline-backup` and delete the scratch directory.
+
+For a *different commit* (not just your dirty tree) there is no entry: the
+working directory is pinned at boot and `--source`, `stash`, `checkout` and
+worktrees are all deliberately absent (see the repository's ADR-0002 for why, and
+what would have to change).
+
 ## Why a server instead of per-command escalation
 
 - One approval per session instead of one per command.
 - Serialization, so parallel toolchain runs cannot corrupt build state.
+- Sub-tools, so a multi-step operation that must call the toolchain (an ARB edit
+  plus `gen-l10n`) is one request with one structured answer instead of a second
+  escalation.
 - UTF-8 logs regardless of the console code page (GBK would otherwise mangle
   CJK output, and even crash a print of `flutter --version`, whose version line
   contains `•`).
+- Server-side log filtering, so a ten-minute suite's noise does not have to be
+  pulled into the agent's context and grepped by hand.
 - Process control: a hung `flutter_tester`/`dart` can be killed by id, with its
   whole tree.
 
@@ -157,16 +428,21 @@ is still a fresh process. The wins are friction, correctness and observability.
 ## Security model
 
 - Binds `127.0.0.1` only, on an ephemeral port.
-- Random 32-char token, constant-time compared; the token exists only in the
-  harness's job output and server memory.
-- Auto-open is the one place the token leaves memory on purpose: it lands in the
-  default browser's address bar and history. That is the same machine and the
+- Random 32-char token, constant-time compared; the token is never written to a
+  file by the bridge. It does exist outside server memory in two places: the
+  harness's job output (which is how the agent reads it) and, when auto-open
+  works, the default browser's address bar and history — the same machine and the
   same user who already reads the job output, and the page needs the token to
   poll `/jobs` at all.
-- Command allowlist (above) enforced in Python, argv-list execution, `cwd`
-  pinned at startup.
-- The process itself runs with full access for its lifetime — that trust is the
-  one-time approval, which is why the command surface stays narrow.
+- **The command surface is a guardrail, not a sandbox.** `dart` takes any
+  subcommand, so `dart run <file>.dart` executes arbitrary code with the access
+  granted at boot; nothing here confines a determined caller. What the narrow
+  surface buys is *recovery cost and surprise* for a fallible one: every refused
+  command is one nobody can lose work to. Refusals are therefore argued as "this
+  can destroy unnamed work", not as "this escalates privilege".
+- The real trust decision is the boot approval: the process holds that access for
+  its lifetime, which is why the escalation is requested once, explicitly, and
+  why the human gets the status page at boot.
 
 ## Troubleshooting
 
@@ -182,6 +458,30 @@ is still a fresh process. The wins are friction, correctness and observability.
   not "fix" it by disabling auto-open; tell the human which tab is current.
 - **`401 missing or bad token`** → wrong/missing token, or the peer was
   unpaired. Re-read the `TOOLHUB TOKEN` line.
+- **My call timed out but the job kept going** → expected, and recoverable: the
+  job is not killed. Fetch `GET /jobs/<id>?tail=N&grep=P`. Next time budget the
+  nested timeouts as in section 3, or use `wait:false`.
+- **`grep is not a valid regex`** → the pattern is a Python regex; escape it
+  (`\[E\]`, not `[E]`).
+- **`404 no such tool: arb-edit`** → the deployed bridge predates the sub-tool.
+  Check `GET /health` for `tools`, then redeploy: `python scripts/sync_to_skills.py`.
+- **`400 'cwd' is not accepted`** → the bridge pins the working directory at boot
+  (ADR-0002). Drop the field, or start a bridge with `--cwd <project>`.
+- **arb-edit job failed with `PLAN FAILED`** → nothing was written. The message
+  names the file and the key: an anchor is missing from that file, or its
+  `deleteFrom`/`deleteTo` is not there. Run the same body with `dryRun` after
+  fixing it.
+- **arb-edit job failed with `genL10n.exitCode != 0`** → the edits *were*
+  written; read `$r.tail`, fix the ARB, re-post.
+- **`git commit needs a message`** → pass the inline `message` field, or one of
+  `-m/--message/-F/--file/-C/--reuse-message`. A bare `git commit` has no editor
+  to open.
+- **`git restore` refused** → the pathspec is not a literal relative path (`.`,
+  `..`, a glob, an absolute path, `:` magic), or the flag is not one of
+  `--staged/--worktree/--quiet`. Pass explicit file paths after `--`.
+- **`failures` is empty but the run failed** → the reporter printed no `[E]`
+  lines (e.g. `-r json`/`-r silent`), or the log was truncated. Read `counts`
+  and the tail.
 - **Job stuck in `queued`** → something ahead of it is still running; check
   `GET /jobs` and kill it if it is a hang.
 - **`--watch-parent` prints "parent pid already gone at boot"** → the watchdog
@@ -201,13 +501,39 @@ is still a fresh process. The wins are friction, correctness and observability.
   property of running it unelevated, not of the toolchain, and it is why the
   real start is the elevated one. To smoke-test the HTTP surface inside the
   sandbox, pass `--log-dir` pointing into the workspace.
+- **Smoke-testing the git surface confined works** against a scratch repository
+  inside the workspace (`git init`, then drive `/run`): the workspace's own
+  `.git` is inside the sandbox's writable area, so commits and `restore`
+  succeed while `git push` and the destructive verbs are still refused. Cleaning
+  that scratch repository up afterwards needs git's read-only loose objects made
+  writable first (`os.chmod(path, stat.S_IWRITE)` before unlinking); a plain
+  `rmtree` fails with `PermissionError: [WinError 5]`.
 
 ## Non-goals (deliberate)
 
-Detached/persistent mode across sessions, git push, destructive git, arbitrary
-command execution, copying build caches between worktrees (CMake/ninja state is
-path-keyed, so copying forces a full reconfigure while the genuinely expensive
-caches — pub cache, SDK artifacts — are already machine-global), and switching
-`cwd` away from the directory it was started in.
+`git push`, git history rewriting (`reset --hard`, `rebase`), whole-worktree
+wipes (`clean`, `git restore .`), `stash`, `checkout`/`switch`, per-job `cwd`
+and worktree-per-baseline entries, detached/persistent mode across sessions,
+arbitrary command execution *by name* (the bridge is not a privilege boundary —
+see the security model), copying build caches between worktrees (CMake/ninja
+state is path-keyed, so copying forces a full reconfigure while the genuinely
+expensive caches — pub cache, SDK artifacts — are already machine-global), and a
+queue-aware early return from `/run` (`wait:false` already expresses it, and
+returning `queued` whenever the queue is non-empty would force polling for the
+common case).
+
+## Deploying changes to this skill
+
+Edit the repository (`D:\Projects\dsh-tool-bridge`), then:
+
+```powershell
+python D:\Projects\dsh-tool-bridge\scripts\sync_to_skills.py
+```
+
+Run it from the repository and expect one `danger-full-access` escalation: it
+writes `~\.dsh\skills\tool-bridge`, which `workspace-write` denies. It copies
+`SKILL.md` and `scripts/`, excludes `CONTEXT.md`/`docs/`/`tests/`, and prunes
+anything in the deployed directory that the repository no longer has — including
+a previously deployed `README.md`, which is no longer part of the skill.
 
 </supporting-info>

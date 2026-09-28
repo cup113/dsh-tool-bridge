@@ -5,7 +5,7 @@ description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain co
 
 <what-to-do>
 
-Source of truth: `D:\Projects\dsh-tool-bridge` (a git repository). DSH discovers
+Source of truth: this repository (a git checkout anywhere on disk). DSH discovers
 and loads the deployed copy at `~\.dsh\skills\tool-bridge`, so below `<skill>`
 means that deployed directory. Edit the repository, then deploy with
 `python scripts/sync_to_skills.py` — it copies `SKILL.md` and `scripts/`, and
@@ -42,8 +42,8 @@ That failure is the ground for retrying **the exact same command** with
 ```
 TOOLHUB SELFTEST OK in 0.7s version=Flutter 3.47.0 • channel stable ...
 TOOLHUB READY port=60549 pid=16288 cwd=... logdir=...
-TOOLHUB TOKEN 2SV0dcqLovVR4FSntAjkau_cy7OdGE5b
-TOOLHUB STATUS http://127.0.0.1:60549/?token=2SV0dcqLovVR4FSntAjkau_cy7OdGE5b
+TOOLHUB TOKEN <per-session token>
+TOOLHUB STATUS http://127.0.0.1:60549/?token=<per-session token>
 ```
 
 Read port and token with `job_output`. Never write them to a file: they live in
@@ -113,7 +113,7 @@ uses while every other command keeps the local SDK:
 
 ```powershell
 python -u <skill>\scripts\toolhub_server.py --cwd "<project>" --watch-parent `
-  --dart-format D:\Tools\dart-3.12.2\bin\dart.exe
+  --dart-format C:\Tools\dart-3.12.2\bin\dart.exe
 ```
 
 - Only **`dart format`** routes to the pin. `dart analyze`/`test`/`pub` and
@@ -135,8 +135,9 @@ python -u <skill>\scripts\toolhub_server.py --cwd "<project>" --watch-parent `
   enough — `dart format` does not need Flutter — so download
   `dartsdk-windows-x64-release.zip` from
   `https://storage.googleapis.com/dart-archive/channels/stable/release/<version>/sdk/`
-  and unpack it to `D:\Tools\dart-<version>`. One download serves every session
-  afterwards.
+  and unpack it to `C:\Tools\dart-<version>`. One download serves every session
+  afterwards. (Where the SDK actually lives is your choice — the flag takes any
+  path. The *version* is not a choice: it comes from the project's CI.)
 
 **Scope to your uncommitted files** — `"scope": "uncommitted"` on `/run`:
 
@@ -683,10 +684,10 @@ common case).
 
 ## Deploying changes to this skill
 
-Edit the repository (`D:\Projects\dsh-tool-bridge`), then:
+Edit the repository, then:
 
 ```powershell
-python D:\Projects\dsh-tool-bridge\scripts\sync_to_skills.py
+python scripts\sync_to_skills.py
 ```
 
 Run it from the repository and expect one `danger-full-access` escalation: it

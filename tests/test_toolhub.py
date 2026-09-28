@@ -1178,14 +1178,14 @@ class DartFormatPinTests(unittest.TestCase):
     CI's `dart format --set-exit-if-changed` check red.
     """
 
-    PIN = r"D:\Tools\dart-3.12.2\bin\dart.exe"
+    PIN = r"D:\pinned\dart.exe"
 
     def test_only_dart_format_routes(self) -> None:
         for argv in (
             ["dart", "format"],
             ["dart", "format", "lib"],
             ["dart", "format", "--output=none", "--set-exit-if-changed", "lib/a.dart"],
-            [r"D:\Tools\flutter\bin\dart.bat", "format", "lib"],
+            [r"D:\flutter\bin\dart.bat", "format", "lib"],
             ["dart.exe", "format"],
         ):
             with self.subTest(argv=argv):

@@ -243,7 +243,8 @@ KNOWN_FAILURES_MAX_BYTES = 512 * 1024
 KNOWN_PLATFORMS = {"windows", "posix"}
 
 # Assessment families an entry may carry, borrowed from the hand-written
-# registry this replaces (cuplivo's docs/known-pre-existing-test-failures-windows.md):
+# registry that motivated this feature — a per-project Markdown table of the
+# failures a Windows machine was already red on:
 # `platform` (fails on this OS only), `flaky` (intermittent), `environment`
 # (setup/machine), `defect` (a real pre-existing bug, in nobody's change) and
 # `unclassified` (recorded, not yet understood).

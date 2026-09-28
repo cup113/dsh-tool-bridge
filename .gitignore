@@ -9,5 +9,12 @@ __pycache__/
 tests/.tmp-arbtool/
 tests/.tmp-arbtool-logs/
 
+# Scratch directories of the formatter-pin, scope and registry tests. The tests
+# remove these themselves; a crashed or interrupted run can leave one behind.
+tests/.tmp-format-pin/
+tests/.tmp-scope/
+tests/.tmp-scope-logs/
+tests/.tmp-registry/
+
 # Ruff's cache, created by `ruff check` in the repository root.
 .ruff_cache/

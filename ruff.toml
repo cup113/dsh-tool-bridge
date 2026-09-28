@@ -1,0 +1,29 @@
+# Lint baseline for dsh-tool-bridge.
+#
+# Deliberately narrow: the families enabled here are the ones this codebase was
+# written against — pycodestyle/pyflakes plus the bandit, naming and
+# blind-except rules its in-place `# noqa: S603` / `# noqa: N802` /
+# `# noqa: BLE001` comments already name. `select = ["ALL"]` was measured and
+# rejected: it reports 111 findings, 70 of them `TRY003` ("avoid long messages
+# outside the exception class") — and long, specific messages are this
+# program's error API, printed verbatim to whoever called it.
+line-length = 88
+target-version = "py311"
+
+[lint]
+select = ["E4", "E7", "E9", "F", "S", "N", "BLE"]
+ignore = [
+    # Name-based: it fires on any variable called `token`, and this program is
+    # *about* tokens (bearer tokens, loop tokens, argv tokens). The only real
+    # hits are fixture strings in the tests, which are not secrets.
+    "S105",
+    # `taskkill` and `git` are taken from PATH on purpose: `resolve_launch`
+    # exists to turn an allowlisted name into an absolute executable, and
+    # hard-coding either path would only break the other platform.
+    "S607",
+]
+
+[lint.per-file-ignores]
+# Tests: `assert` is how they state expectations, and the HTTP ones talk to a
+# loopback server of their own making.
+"tests/*" = ["S101", "S310"]

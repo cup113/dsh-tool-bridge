@@ -19,14 +19,21 @@ from __future__ import annotations
 
 import argparse
 import filecmp
-import io
 import os
 import re
 import shutil
 import sys
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXCLUDE_DIRS = {".git", "__pycache__", ".idea", ".vscode", ".ruff_cache", "docs", "tests"}
+EXCLUDE_DIRS = {
+    ".git",
+    "__pycache__",
+    ".idea",
+    ".vscode",
+    ".ruff_cache",
+    "docs",
+    "tests",
+}
 EXCLUDE_SUFFIXES = (".pyc", ".pyo")
 # Repository-only files: the deployed skill is SKILL.md plus the server, and
 # deliberately carries no documentation. Note that excluding a file also prunes
@@ -37,7 +44,7 @@ EXCLUDE_FILES = {"README.md", "CONTEXT.md"}
 def skill_name(root: str) -> str:
     """The `name:` of SKILL.md frontmatter — the directory DSH will look in."""
     try:
-        text = io.open(os.path.join(root, "SKILL.md"), encoding="utf-8").read()
+        text = open(os.path.join(root, "SKILL.md"), encoding="utf-8").read()
     except OSError:
         return os.path.basename(root)
     match = re.search(r"^name:\s*(.+)$", text, re.MULTILINE)
@@ -74,7 +81,8 @@ def main() -> int:
     parser.add_argument("--dest", default=None)
     args = parser.parse_args()
     dest = os.path.abspath(
-        args.dest or os.path.join(os.path.expanduser("~"), ".dsh", "skills", skill_name(PROJECT))
+        args.dest
+        or os.path.join(os.path.expanduser("~"), ".dsh", "skills", skill_name(PROJECT))
     )
 
     files = project_files(PROJECT)

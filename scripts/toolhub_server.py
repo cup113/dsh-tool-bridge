@@ -339,7 +339,7 @@ class Job:
             return False
         try:
             if IS_WINDOWS:
-                subprocess.run(
+                subprocess.run(  # noqa: S603 - argv list, no shell
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True,
                     creationflags=CREATE_NO_WINDOW,
@@ -1147,9 +1147,7 @@ def split_tool_body(body: dict[str, object]) -> dict[str, object]:
     argv and the knobs that shape the response.
     """
     return {
-        key: value
-        for key, value in body.items()
-        if key not in TOOL_TRANSPORT_FIELDS
+        key: value for key, value in body.items() if key not in TOOL_TRANSPORT_FIELDS
     }
 
 
@@ -1412,21 +1410,15 @@ def resolve_launch(
         # flutter_tools appends `bin/cache` to FLUTTER_ROOT itself.
         flutter_bin = os.path.dirname(exe)
         flutter_root = os.path.dirname(flutter_bin)
-        dart_exe = os.path.join(
-            flutter_bin, "cache", "dart-sdk", "bin", "dart.exe"
-        )
+        dart_exe = os.path.join(flutter_bin, "cache", "dart-sdk", "bin", "dart.exe")
         if not os.path.exists(dart_exe):
             raise FileNotFoundError(
                 f"{exe} is a wrapper but its SDK dart.exe is missing: {dart_exe}"
             )
         if os.path.basename(exe).lower().startswith("flutter"):
-            snapshot = os.path.join(
-                flutter_bin, "cache", "flutter_tools.snapshot"
-            )
+            snapshot = os.path.join(flutter_bin, "cache", "flutter_tools.snapshot")
             if not os.path.exists(snapshot):
-                raise FileNotFoundError(
-                    f"flutter_tools.snapshot missing: {snapshot}"
-                )
+                raise FileNotFoundError(f"flutter_tools.snapshot missing: {snapshot}")
             return (
                 [dart_exe, snapshot, *argv[1:]],
                 {"FLUTTER_ROOT": flutter_root},
@@ -1985,8 +1977,7 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                     self._discard_body()
                     self._error(
                         404,
-                        f"no such tool: {name} "
-                        f"(available: {', '.join(TOOL_NAMES)})",
+                        f"no such tool: {name} (available: {', '.join(TOOL_NAMES)})",
                     )
                     return
                 try:
@@ -2059,10 +2050,7 @@ def open_status_page(url: str) -> None:
     if opened:
         eprint(f"TOOLHUB OPEN opened in the default browser url={redacted(url)}")
     else:
-        eprint(
-            "TOOLHUB OPEN FAILED reason=no-browser-answered "
-            f"url={redacted(url)}"
-        )
+        eprint(f"TOOLHUB OPEN FAILED reason=no-browser-answered url={redacted(url)}")
 
 
 def open_soon(url: str, delay: float = 0.3) -> None:
@@ -2173,6 +2161,7 @@ def selfcheck(timeout: float) -> bool:
             timeout=timeout,
             env=env,
             creationflags=CREATE_NO_WINDOW,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         eprint(
@@ -2273,7 +2262,7 @@ def parent_alive(pid: int) -> bool:
     return True
 
 
-def watch_parent(hub: "ToolHub", pid: int) -> None:
+def watch_parent(hub: ToolHub, pid: int) -> None:
     """Kills children and exits when the process that started us disappears.
 
     A force-killed parent gives a Windows child no signal, so a leaked
@@ -2422,9 +2411,7 @@ def main() -> int:
     server.daemon_threads = True
     port = server.server_address[1]
     status_url = f"http://127.0.0.1:{port}/?token={token}"
-    eprint(
-        f"TOOLHUB READY port={port} pid={os.getpid()} cwd={cwd} logdir={log_dir}"
-    )
+    eprint(f"TOOLHUB READY port={port} pid={os.getpid()} cwd={cwd} logdir={log_dir}")
     eprint(f"TOOLHUB TOKEN {token}")
     eprint(f"TOOLHUB STATUS {status_url}")
 

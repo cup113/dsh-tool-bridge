@@ -1,0 +1,15 @@
+# Checkouts are LF everywhere, so a test that asserts a line ending sees the one
+# the repository stores, whatever `core.autocrlf` the machine happens to use.
+# Without this, `actions/checkout` on Windows (Git for Windows defaults to
+# `core.autocrlf=true`) hands the suite CRLF fixtures and the line-ending tests
+# fail on CI while passing on a machine with autocrlf off.
+* text=auto eol=lf
+
+# The one deliberate exception. These two fixtures are the material for the
+# line-ending tests: `test_lf_files_stay_lf` edits `app_en.arb` and asserts the
+# result has no CRLF, `test_crlf_and_cjk_survive_an_edit` edits `app_zh.arb` and
+# asserts it still has CRLF. Both are about what the editor does to the file it
+# was handed, so the ending each one is checked out with is part of the test
+# contract, not a checkout accident.
+tests/fixtures/arb/lib/l10n/app_en.arb text eol=lf
+tests/fixtures/arb/lib/l10n/app_zh.arb text eol=crlf

@@ -101,7 +101,72 @@ $r.tail       # the last 80 matching lines
   is parsed as a variable named `id?tail`, mangling the URL into a 404. Use a
   subexpression: `".../jobs/$($id)?tail=5"`.
 
-## 3. Caller timeouts (the queue is not free)
+## 3. Format the way CI formats (and scope a command to your changes)
+
+`dart format` output changes between dart releases, and CI format-checks with
+**the dart bundled in the Flutter version its workflow pins**. So files
+formatted by a newer local SDK fail CI's `--set-exit-if-changed` check even
+though nothing looks unformatted locally. Two knobs close that gap.
+
+**Pin the formatter** — a start flag, so `dart format` jobs run the dart CI
+uses while every other command keeps the local SDK:
+
+```powershell
+python -u <skill>\scripts\toolhub_server.py --cwd "<project>" --watch-parent `
+  --dart-format D:\Tools\dart-3.12.2\bin\dart.exe
+```
+
+- Only **`dart format`** routes to the pin. `dart analyze`/`test`/`pub` and
+  every `flutter` command deliberately keep the locally installed SDK.
+- **Why `analyze` is not pinned too**: its verdict depends on the SDK's analyzer
+  *and* on the Flutter framework version resolved through the package config
+  (locally 3.47.x, on CI whatever the workflow pins). A pin would align the
+  analyzer and leave the framework wrong, so a local/CI `analyze` disagreement
+  is usually a framework-version story — pinning cannot fix it, a second Flutter
+  install would. `dart format` has no such coupling: its behaviour *is* the SDK's
+  bundled formatter, which is why the pin is exact there.
+- The boot prints the version it will format with
+  (`TOOLHUB DART-FORMAT OK version=Dart SDK version: 3.12.2 ...`) and refuses to
+  start when the pin cannot run; `GET /health` reports it as `dartFormatExe`;
+  the job's `resolvedArgv` is what actually ran.
+- **Finding the version to pin**: take the `dart_sdk_version` of the Flutter
+  version in the project's workflow (`.github/workflows/*.yml`, e.g.
+  `FLUTTER_VERSION: '3.44.6'` → dart **3.12.2**). A *standalone* dart SDK is
+  enough — `dart format` does not need Flutter — so download
+  `dartsdk-windows-x64-release.zip` from
+  `https://storage.googleapis.com/dart-archive/channels/stable/release/<version>/sdk/`
+  and unpack it to `D:\Tools\dart-<version>`. One download serves every session
+  afterwards.
+
+**Scope to your uncommitted files** — `"scope": "uncommitted"` on `/run`:
+
+```powershell
+# exactly what CI's changed-files format check does, run locally:
+$body=@{cmd='dart';args=@('format','--output=none','--set-exit-if-changed');
+  scope='uncommitted'}|ConvertTo-Json -Compress
+$r = Invoke-RestMethod "http://127.0.0.1:$port/run" -Method Post -Headers $h -Body $body
+$r.argv        # dart format --output=none --set-exit-if-changed <your files...>
+$r.exitCode    # 0 means CI's format check would pass
+```
+
+- The set comes from `git status` in the pinned cwd, read once at submit time:
+  staged, unstaged and untracked `.dart` files; deleted and ignored ones
+  excluded. (CI compares two commits and never sees untracked files — this is
+  the working tree.)
+- `dart format` receives the files as trailing paths, so the formatter itself is
+  narrowed. `dart analyze` takes at most one *directory* and `dart fix` takes no
+  path at all, so there the same scope narrows the **returned lines** instead:
+  your files' diagnostics come back (`$r.log.matched`), while `exitCode` still
+  describes the whole project — a pre-existing issue in an untouched file still
+  fails the run.
+- **Nothing uncommitted is a 400**, on purpose: `dart format` with no paths
+  rewrites the entire tree, which is the opposite of scoping.
+- `scope` and `grep` are both log filters and cannot be combined; a command
+  that cannot be scoped (`git`, `dart test`, ...) is a 403.
+- The two knobs compose: a scoped `dart format` runs the **pinned** dart on your
+  changed files.
+
+## 4. Caller timeouts (the queue is not free)
 
 `wait:true` blocks for **queue time plus run time**, and `timeoutSec` bounds that
 whole wait — not just the execution. When it expires the server returns the job
@@ -130,7 +195,7 @@ with `GET /jobs/<id>?tail=N&grep=P` — including the digest, since the failure
 inventory rides with the log view. `/jobs` lists everything with `summary` and
 `counts` but no logs or failure lists, so it stays cheap to read.
 
-## 4. Edit ARB localization files (sub-tool)
+## 5. Edit ARB localization files (sub-tool)
 
 `flutter gen-l10n` cannot run confined, which used to make an ARB edit cost a
 second escalation. It is a bridge **sub-tool** now: the edit, the gen-l10n run
@@ -169,7 +234,7 @@ $r.result.untranslated  # null, or {file, lines, content} — a warning, not a f
   below. Run `/health` first if you are unsure whether the deployed bridge has
   this sub-tool: it reports `tools`.
 
-## 5. Stop it
+## 6. Stop it
 
 `POST /stop` when work is done (`Invoke-RestMethod ".../stop" -Method Post
 -Headers $h`). If it is left running, the parent watchdog ends it when the
@@ -184,9 +249,9 @@ session binds a new random port.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | liveness + `tools` (the sub-tools this bridge supports); no token |
+| GET | `/health` | liveness + `tools` (the sub-tools this bridge supports) + `dartFormatExe` (the formatter pin, or null); no token |
 | GET | `/?token=…` | human status page: job list + live log tail (browser-friendly; opened automatically at boot) |
-| POST | `/run` | `{"cmd","args","message","wait","timeoutSec","grep","tail"}` → job; `wait:true` blocks until done |
+| POST | `/run` | `{"cmd","args","message","scope","wait","timeoutSec","grep","tail"}` → job; `wait:true` blocks until done |
 | POST | `/tools/arb-edit` | `{"groups","dryRun","wait","timeoutSec","grep","tail"}` → job with a structured `result` |
 | GET | `/jobs` | all jobs, newest last (no logs, no failure lists) |
 | GET | `/jobs/<id>?tail=N&grep=P` | one job + last N log lines (default 200), or the last N lines matching the `P` regex |
@@ -198,9 +263,9 @@ All but `/health` require `Authorization: Bearer <token>` (the status page may
 pass `?token=` instead, since a browser cannot set headers).
 
 Job JSON: `id, kind (cmd|tool), argv, resolvedArgv, status
-(queued|running|done|failed|killed), exitCode, startedAt, finishedAt,
-durationSec, summary, counts, error, result, logPath`, plus `tail`, `log` and
-`failures` whenever the response carries a log view.
+(queued|running|done|failed|killed), scope, exitCode, startedAt, finishedAt,
+durationSec, summary, counts, error, result, logPath`, plus `tail`, `log`,
+`failures` and `baseline` whenever the response carries a log view.
 
 ### Sub-tool: arb-edit
 
@@ -336,6 +401,69 @@ so they go in `args`):
   normal file tools; use it when you need ids, timings, or a second opinion on
   the inventory.
 
+### "Is this failure mine?" — the known-failure registry
+
+A project can write down the failures that were **already red before your
+change** (platform-specific, flaky, not-yours-yet) in
+`<project>/.toolbridge/known-failures.json`. Every test job then reports the
+split, so a red local run can be read instead of re-diagnosed:
+
+```json
+{
+  "entries": [
+    {
+      "file": "test/utils/sandbox_path_resolver_test.dart",
+      "match": "^SandboxPathResolver\\.",
+      "kind": "platform",
+      "platform": "windows",
+      "reason": "path separator: expected '/' actual '\\'"
+    },
+    {
+      "name": "concurrent sends persist a single user/assistant pair",
+      "kind": "flaky",
+      "reason": "tearDown races the temp-file lock"
+    }
+  ]
+}
+```
+
+- Each entry needs **exactly one** of `name` (exact test name) or `match` (a
+  regex searched in it). Optional: `file` narrows it to one suite (a relative
+  path; the reporter's absolute, mixed-separator path is normalised), `platform`
+  (`windows`/`posix`) keeps a Windows-only family from silencing CI's Linux run,
+  and `kind` (`platform`/`flaky`/`environment`/`defect`/`unclassified`) plus
+  `reason` ride into the response. The first matching entry wins. A failure whose
+  path the reporter did not print (a single-file run) cannot match a
+  `file`-scoped entry — it stays new rather than being attributed to the wrong
+  suite.
+- The digest answers in three places, and **only one of them names the new
+  failures**:
+
+  | field | what it gives you |
+  |---|---|
+  | `failures[i].known` | `{kind, reason}` when the registry claimed that failure; **absent = new** |
+  | `baseline.newFailures` | **the complete, ordered list of the new ones** — read this to act |
+  | `summary` | the glance: `83 passed, 4 failed (3 known, 1 new)` |
+
+  So the `summary` suffix tells you *whether* to look; `baseline.newFailures`
+  tells you *which*. No summary ever names individual tests — never report
+  "which failed" from the one-liner alone.
+- `baseline.source` is the registry path. A file that exists but cannot be read
+  sets `baseline.error` and **claims nothing**: every parsed failure counts as
+  new and no split appears in `summary` (a regression must never hide behind a
+  broken file). No file at all means the feature is off and `baseline` is
+  `null`.
+- The split counts **distinct tests**, not progress lines: a test that fails in
+  its body *and* in its `tearDown` prints two `[E]` lines while `counts.failed`
+  counts it once (`baseline.tests` vs `baseline.events`). `baseline.failed` is
+  that authoritative count and `baseline.unparsed` is the part of it the
+  inventory never named; the `summary` suffix appears only when
+  `known + new + unparsed == failed`. When the two cannot be reconciled the
+  one-liner stays plain on purpose — a summary that contradicts its own first
+  number is worse than no hint.
+- The registry is read per job from the pinned cwd, so adding an entry needs no
+  restart. It lives in the project, so it can be committed and shared.
+
 ## Git: what it will and will not run
 
 - `flutter` and `dart`: any subcommand, any arguments.
@@ -382,7 +510,9 @@ shell anywhere. On Windows `flutter`/`dart` are `.bat` wrappers that
 CreateProcess cannot execute, so the server launches the SDK's own
 `dart.exe` (+ `flutter_tools.snapshot`) directly, which is also what keeps
 `cmd.exe` and its parsing rules out of the path; `resolvedArgv` shows what
-actually ran. Git jobs run with `GIT_TERMINAL_PROMPT=0`, so nothing can block on
+actually ran. A `dart format` job under a formatter pin launches the pinned
+`dart.exe` instead, and no request can retarget that (section 3). Git jobs run
+with `GIT_TERMINAL_PROMPT=0`, so nothing can block on
 a credential or signing prompt that this process has no terminal to answer.
 
 Jobs run **one at a time** on purpose: concurrent Flutter invocations fight
@@ -460,9 +590,26 @@ is still a fresh process. The wins are friction, correctness and observability.
   unpaired. Re-read the `TOOLHUB TOKEN` line.
 - **My call timed out but the job kept going** → expected, and recoverable: the
   job is not killed. Fetch `GET /jobs/<id>?tail=N&grep=P`. Next time budget the
-  nested timeouts as in section 3, or use `wait:false`.
+  nested timeouts as in section 4, or use `wait:false`.
 - **`grep is not a valid regex`** → the pattern is a Python regex; escape it
   (`\[E\]`, not `[E]`).
+- **CI fails `--set-exit-if-changed` on files that `dart format` locally leaves
+  alone** → the local dart is newer than the one CI formats with. Start the
+  bridge with `--dart-format <the SDK CI pins>` (section 3) and re-check;
+  `GET /health` says whether the running bridge has a pin, and the job's
+  `resolvedArgv` shows which dart actually ran.
+- **`403 scope is not supported for ...`** → only `dart format` takes a scope as
+  trailing paths, and only `dart`/`flutter` `analyze` and `fix` take it as an
+  output filter. `git`, `dart test` and the rest cannot be scoped.
+- **`400 no uncommitted .dart files to scope this command to`** → nothing in the
+  working tree is an uncommitted Dart file. Deliberate: running `dart format`
+  with no paths would rewrite the whole tree, so an empty scope is refused
+  rather than silently widened.
+- **`400 git status failed ...` / `git status timed out`** → the pinned cwd is
+  not a git repository (or git is not on PATH). The uncommitted scope needs one;
+  drop `scope` to run the command anyway.
+- **`400 pass either grep or scope, not both`** → both narrow the returned log
+  lines; combine them yourself or pick one.
 - **`404 no such tool: arb-edit`** → the deployed bridge predates the sub-tool.
   Check `GET /health` for `tools`, then redeploy: `python scripts/sync_to_skills.py`.
 - **`400 'cwd' is not accepted`** → the bridge pins the working directory at boot
@@ -482,6 +629,15 @@ is still a fresh process. The wins are friction, correctness and observability.
 - **`failures` is empty but the run failed** → the reporter printed no `[E]`
   lines (e.g. `-r json`/`-r silent`), or the log was truncated. Read `counts`
   and the tail.
+- **`baseline.error` is set and no split appears in `summary`** → the registry
+  file exists but is malformed: bad JSON, an entry with neither or both of
+  `name`/`match`, an unknown `kind`/`platform`, or an invalid regex. The message
+  names the entry (`entries[3] ...`). Until it is fixed, every failure counts as
+  new.
+- **The registry never seems to match** → check `platform` (a `windows` entry is
+  ignored elsewhere), `file` (a relative path inside the project), and whether a
+  `name` is the *full* test name as the reporter prints it (`failures[i].name`
+  shows it verbatim — copy from there, or use `match`).
 - **Job stuck in `queued`** → something ahead of it is still running; check
   `GET /jobs` and kill it if it is a hang.
 - **`--watch-parent` prints "parent pid already gone at boot"** → the watchdog
@@ -515,7 +671,10 @@ is still a fresh process. The wins are friction, correctness and observability.
 wipes (`clean`, `git restore .`), `stash`, `checkout`/`switch`, per-job `cwd`
 and worktree-per-baseline entries, detached/persistent mode across sessions,
 arbitrary command execution *by name* (the bridge is not a privilege boundary —
-see the security model), copying build caches between worktrees (CMake/ninja
+see the security model), a per-request formatter or SDK override (the pin is
+boot-scoped, like the cwd) and a scope for any command but `dart format`, `dart
+analyze`/`fix` and `flutter analyze`/`fix`, copying build caches between
+worktrees (CMake/ninja
 state is path-keyed, so copying forces a full reconfigure while the genuinely
 expensive caches — pub cache, SDK artifacts — are already machine-global), and a
 queue-aware early return from `/run` (`wait:false` already expresses it, and

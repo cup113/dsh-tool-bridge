@@ -52,8 +52,8 @@ API (all but /health need ``Authorization: Bearer <token>``)
 -----------------------------------------------------------
 - ``GET  /health``                -> {"ok": true}
 - ``GET  /``                      -> human status page (token in the query string)
-- ``POST /run``                   -> {"cmd","args","message","wait","timeoutSec",
-                                     "grep","tail"} -> job
+- ``POST /run``                   -> {"cmd","args","message","scope","wait",
+                                     "timeoutSec","grep","tail"} -> job
 - ``GET  /jobs``                  -> [job]
 - ``GET  /jobs/<id>?tail=N&grep=P`` -> job + last N log lines (or the last N
                                      lines matching the P regex)
@@ -75,6 +75,35 @@ member is ``arb-edit`` (see ``arb_edit_lib``), which is why the retired
 ``flutter-arb-edit`` skill no longer needs its own elevated step: ``flutter
 gen-l10n`` now runs in the pinned cwd, on the one worker, through the same
 ``resolve_launch`` that keeps ``cmd.exe`` out of the path.
+
+Formatter pin and uncommitted scope
+-----------------------------------
+``--dart-format <path-to-dart.exe>`` routes **`dart format` jobs only** to that
+executable, so a session can format with the dart the project's CI pins while
+every other command keeps the locally installed SDK (``dart
+analyze``/``test``/``pub`` must match the local Flutter, not CI). The pin is
+checked at boot (``<exe> --version``) and reported by ``/health`` as
+``dartFormatExe``; a job's ``resolvedArgv`` shows what actually ran.
+
+``"scope": "uncommitted"`` on ``/run`` narrows a command to the working tree's
+uncommitted ``.dart`` files, read in the pinned cwd with ``git status
+--porcelain -z`` (staged, unstaged and untracked; deleted and ignored
+excluded). ``dart format`` receives them as trailing file paths — exactly the
+set CI format-checks. ``dart analyze`` takes at most one directory and ``dart
+fix`` takes no path at all, so there the scope filters the returned log lines to
+those files instead, while the exit code still covers the whole project. An empty
+set is a 400: ``dart format`` with no paths would rewrite the whole tree.
+
+Known-failure registry
+----------------------
+An optional ``<cwd>/.toolbridge/known-failures.json`` records the failures that
+were already red before the caller's change — platform-specific, flaky, or
+merely not theirs yet. A test job's digest then annotates every matching failure
+with ``known``, appends the split to ``summary`` (``4 failed (3 known, 1 new)``)
+and reports ``baseline.newFailures``: the complete, ordered list of the ones that
+are *new*, which is the answer a caller has to act on. Without the file nothing
+changes; a registry that cannot be read says so in ``baseline.error`` rather
+than looking like "everything is new" or "everything is known".
 """
 
 from __future__ import annotations
@@ -177,6 +206,49 @@ MESSAGE_SOURCE_FLAGS = {
     "--no-edit",
 }
 
+# The one scope a `/run` body may name today: the working tree's uncommitted
+# files. The name is deliberately the caller's word for it, not a git term.
+SCOPE_UNCOMMITTED = "uncommitted"
+
+# Verbs a scope may be applied to, split by *how*: `dart format` takes any
+# number of trailing paths, so the files are appended to argv and the tool
+# itself is narrowed. `dart analyze` takes at most one directory and `dart fix`
+# takes no path at all (their `flutter` wrappers likewise — verified against
+# `dart fix --help` / `dart analyze --help`), so no argv can express "these
+# files" — there the scope narrows the *reported* lines instead, and the exit
+# code still covers the whole project. Everything else (`dart test`, `git ...`,
+# sub-tools) is refused: a scope that silently did nothing would be worse than
+# no scope at all.
+SCOPE_EXPAND_VERBS = {"format"}
+SCOPE_FILTER_VERBS = {"analyze", "fix"}
+SCOPE_COMMANDS = {"dart", "flutter"}
+
+# Endings a scoped command cares about. The scope is a Dart-tooling scope, so
+# a changed README or ARB file is not a target.
+SCOPE_FILE_SUFFIX = ".dart"
+
+# How long `git status` may take before the scope is refused. It runs at submit
+# time, so a slow answer costs a request rather than a queued job.
+GIT_STATUS_TIMEOUT = 20.0
+
+# The known-failure registry: an optional per-project file the test digest reads
+# so that "is this failure mine?" is answered by data instead of by memory
+# (CONTEXT.md calls this baseline attribution). Absent file, absent behaviour.
+KNOWN_FAILURES_RELPATH = ".toolbridge/known-failures.json"
+KNOWN_FAILURES_MAX_BYTES = 512 * 1024
+
+# Platforms an entry may be gated to. The bridge only knows one distinction
+# locally — Windows or not — and that is the one that matters: CI runs Linux,
+# where a Windows-only family is expected to pass.
+KNOWN_PLATFORMS = {"windows", "posix"}
+
+# Assessment families an entry may carry, borrowed from the hand-written
+# registry this replaces (cuplivo's docs/known-pre-existing-test-failures-windows.md):
+# `platform` (fails on this OS only), `flaky` (intermittent), `environment`
+# (setup/machine), `defect` (a real pre-existing bug, in nobody's change) and
+# `unclassified` (recorded, not yet understood).
+KNOWN_KINDS = {"platform", "flaky", "environment", "defect", "unclassified"}
+
 
 def eprint(*parts: object) -> None:
     """Lifecycle lines on stdout (the harness reads them), errors on stderr.
@@ -208,6 +280,7 @@ class Job:
         cwd: str,
         log_path: str,
         runner: Callable[[Job], None] | None = None,
+        scope: str | None = None,
     ) -> None:
         self.id = uuid.uuid4().hex[:12]
         # For a sub-tool job this is the display argv the status page shows;
@@ -218,6 +291,9 @@ class Job:
         # A runner means "sub-tool": the worker calls it instead of spawning
         # argv, which is what keeps a sub-tool on the one-job-at-a-time queue.
         self.runner = runner
+        # The scope the request asked for, kept for observability: `argv` shows
+        # the expansion, this says where those paths came from.
+        self.scope = scope
         self.status = "queued"  # queued|running|done|failed|killed
         self.exit_code: int | None = None
         self.resolved: list[str] | None = None
@@ -229,6 +305,8 @@ class Job:
         self.failures: list[TestFailure] = []
         # The structured outcome of a sub-tool; None for a command job.
         self.result: dict[str, object] | None = None
+        # The known-failure split of a test run; None without a registry.
+        self.baseline: BaselineReport | None = None
         self._process: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()
 
@@ -284,6 +362,7 @@ class Job:
             "argv": self.argv,
             "resolvedArgv": self.resolved,
             "status": self.status,
+            "scope": self.scope,
             "exitCode": self.exit_code,
             "startedAt": self.started_at,
             "finishedAt": self.finished_at,
@@ -304,8 +383,9 @@ class Job:
             payload["log"] = log_meta
             # The failure inventory rides with the log view: it is a list, and
             # the `/jobs` overview (which carries no log) would otherwise repeat
-            # every failure of every job.
+            # every failure of every job. The baseline split is the same shape.
             payload["failures"] = self.failures
+            payload["baseline"] = self.baseline
         return payload
 
 
@@ -427,12 +507,30 @@ TEST_TERMINAL_MARKERS = (
 )
 
 
-class TestFailure(TypedDict):
-    """One failing (or unfinished) test, as the progress lines report it."""
+class KnownMatch(TypedDict):
+    """Why a failure is not the caller's: the registry entry that claimed it."""
+
+    kind: str
+    reason: str | None
+
+
+class ReportedFailure(TypedDict):
+    """One failing (or unfinished) test, exactly as the progress lines report it."""
 
     file: str | None
     name: str
     didNotComplete: bool
+
+
+class TestFailure(ReportedFailure, total=False):
+    """A reported failure plus the registry's verdict, when one applied.
+
+    ``known`` is the per-failure half of the digest's answer: its presence means
+    "this was already red before your change", and its absence means the failure
+    is new — which is also why it must never be spelled ``false``.
+    """
+
+    known: KnownMatch
 
 
 class TestCounts(TypedDict):
@@ -595,6 +693,290 @@ def analyze_test_log(argv: list[str], log_path: str) -> TestLogDigest:
     result["counts"] = counts
     result["summary"] = summarize_test_run(counts, terminal)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Known-failure registry (baseline attribution)
+# ---------------------------------------------------------------------------
+
+
+class KnownEntry(TypedDict):
+    """One registry entry, normalised and ready to match."""
+
+    file: str | None
+    name: str | None
+    pattern: re.Pattern[str] | None
+    kind: str
+    platform: str | None
+    reason: str | None
+
+
+class Registry(TypedDict):
+    """A loaded registry: where it lives, what it holds, why it may be empty."""
+
+    path: str
+    exists: bool
+    entries: list[KnownEntry]
+    error: str | None
+
+
+class BaselineReport(TypedDict):
+    """The digest's answer to "is this failure mine?".
+
+    ``known``/``new`` count **distinct tests**, which is the unit ``failed``
+    states; ``events`` is how many ``[E]`` lines carried them, and ``unparsed``
+    is the part of ``failed`` the inventory never named. ``known + new +
+    unparsed == failed`` whenever the inventory is reconcilable with the
+    authoritative count, which is exactly when ``summary`` may carry the split.
+    """
+
+    source: str
+    known: int
+    new: int
+    failed: int | None
+    tests: int
+    events: int
+    unparsed: int
+    newFailures: list[TestFailure]
+    error: str | None
+
+
+def current_platform() -> str:
+    """`windows` or `posix` — the only platform distinction the bridge knows."""
+    return "windows" if IS_WINDOWS else "posix"
+
+
+def parse_known_failures(raw: object) -> list[KnownEntry]:
+    """Validates a registry document. Raises ValueError naming the entry.
+
+    Every entry needs exactly one of `name` (the test name, exact) or `match` (a
+    regex searched in it), and may narrow further with `file`, `platform`,
+    `kind` and `reason`. Validation is strict on purpose: a typo that silently
+    matched nothing would make a known failure look new — which is the one
+    direction this feature must never fail in.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("registry must be a JSON object")
+    entries = raw.get("entries")
+    if not isinstance(entries, list):
+        raise ValueError("registry needs an 'entries' list")
+    parsed: list[KnownEntry] = []
+    for index, entry in enumerate(entries):
+        where = f"entries[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where} must be an object")
+        name = entry.get("name")
+        source = entry.get("match")
+        if (name is None) == (source is None):
+            raise ValueError(f"{where} needs exactly one of 'name' or 'match'")
+        if name is not None and not isinstance(name, str):
+            raise ValueError(f"{where}.name must be a string")
+        pattern: re.Pattern[str] | None = None
+        if source is not None:
+            if not isinstance(source, str):
+                raise ValueError(f"{where}.match must be a string")
+            try:
+                pattern = re.compile(source)
+            except re.error as error:
+                raise ValueError(
+                    f"{where}.match is not a valid regex: {error}"
+                ) from error
+        file_name = entry.get("file")
+        if file_name is not None and not isinstance(file_name, str):
+            raise ValueError(f"{where}.file must be a string")
+        kind = entry.get("kind", "unclassified")
+        if kind not in KNOWN_KINDS:
+            raise ValueError(f"{where}.kind must be one of {sorted(KNOWN_KINDS)}")
+        platform = entry.get("platform")
+        if platform is not None and platform not in KNOWN_PLATFORMS:
+            raise ValueError(
+                f"{where}.platform must be one of {sorted(KNOWN_PLATFORMS)}"
+            )
+        reason = entry.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError(f"{where}.reason must be a string")
+        parsed.append(
+            {
+                "file": file_name,
+                "name": name,
+                "pattern": pattern,
+                "kind": kind,
+                "platform": platform,
+                "reason": reason,
+            }
+        )
+    return parsed
+
+
+def load_known_failures(cwd: str) -> Registry:
+    """Reads ``<cwd>/.toolbridge/known-failures.json``. Never raises.
+
+    A registry that cannot be read comes back with ``entries == []`` and an
+    ``error``, and the digest repeats that verbatim. The reason is the failure
+    mode this whole feature is about: "everything is new" and "everything is
+    known" must never look alike, so a broken file must announce itself instead
+    of quietly claiming nothing.
+    """
+    path = os.path.join(cwd, *KNOWN_FAILURES_RELPATH.split("/"))
+    registry: Registry = {
+        "path": KNOWN_FAILURES_RELPATH,
+        "exists": False,
+        "entries": [],
+        "error": None,
+    }
+    if not os.path.isfile(path):
+        return registry
+    registry["exists"] = True
+    try:
+        if os.path.getsize(path) > KNOWN_FAILURES_MAX_BYTES:
+            raise ValueError(
+                f"registry is larger than {KNOWN_FAILURES_MAX_BYTES} bytes"
+            )
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            raw = json.load(handle)
+        registry["entries"] = parse_known_failures(raw)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        registry["error"] = str(error)
+    return registry
+
+
+def path_matches(actual: str | None, expected: str) -> bool:
+    """Whether a failure's reported path is the registry's relative path.
+
+    The reporter prints an absolute path, and on Windows often one with mixed
+    separators (that mixedness is itself a whole family of Windows-only
+    failures), so this is a segment-boundary suffix test over normalised
+    slashes — case-insensitive on Windows, because that is what the filesystem
+    is.
+    """
+    if not actual:
+        return False
+    reported = actual.replace("\\", "/")
+    wanted = expected.replace("\\", "/").lstrip("/")
+    if IS_WINDOWS:
+        reported, wanted = reported.lower(), wanted.lower()
+    return reported == wanted or reported.endswith("/" + wanted)
+
+
+def known_entry_for(
+    entries: list[KnownEntry], failure: TestFailure
+) -> KnownEntry | None:
+    """The first entry that claims this failure, or None. Entries are ordered.
+
+    A `file`-scoped entry never claims a failure the reporter printed without a
+    path (a single-file run): the alternative would be attributing an unknown
+    failure to whichever suite happened to be named in the registry — the one
+    direction this feature must not fail in.
+    """
+    name = failure.get("name") or ""
+    platform = current_platform()
+    for entry in entries:
+        if entry["platform"] is not None and entry["platform"] != platform:
+            continue
+        if entry["file"] is not None and not path_matches(
+            failure.get("file"), entry["file"]
+        ):
+            continue
+        if entry["name"] is not None:
+            if name == entry["name"]:
+                return entry
+            continue
+        pattern = entry["pattern"]
+        if pattern is not None and pattern.search(name):
+            return entry
+    return None
+
+
+def baseline_report(
+    failures: list[TestFailure],
+    counts: TestCounts | None,
+    registry: Registry,
+) -> BaselineReport | None:
+    """Splits a run's failures into known and new. None when there is no registry.
+
+    ``failures`` is annotated **in place** with ``known``, because one entry has
+    to be readable on its own. The list that says *which* failures are new is
+    ``newFailures``; ``summary`` only carries the counts. A caller that has to
+    act on a regression must read the list — the one-liner is a glance, not the
+    answer.
+
+    The split counts **distinct tests** (``file`` + ``name``), not ``[E]``
+    events: a test that fails in its body *and* in its tearDown prints two
+    progress lines, while the authoritative ``counts.failed`` counts it once.
+    Counting events would make the split disagree with the very number the
+    summary leads with — observed on a real 6105-test run, where 79 ``[E]`` lines
+    covered 77 failing tests. Every event is still annotated; only the tally
+    deduplicates.
+    """
+    if not registry["exists"]:
+        return None
+    report: BaselineReport = {
+        "source": registry["path"],
+        "known": 0,
+        "new": 0,
+        "failed": counts["failed"] if counts is not None else None,
+        "tests": 0,
+        "events": len(failures),
+        "unparsed": 0,
+        "newFailures": [],
+        "error": registry["error"],
+    }
+    entries = registry["entries"] if registry["error"] is None else []
+    new_failures: list[TestFailure] = []
+    counted: set[tuple[str | None, str]] = set()
+    known = 0
+    for failure in failures:
+        entry = known_entry_for(entries, failure)
+        if entry is not None:
+            failure["known"] = {"kind": entry["kind"], "reason": entry["reason"]}
+        key = (failure.get("file"), failure.get("name") or "")
+        if key in counted:
+            continue  # the same test's second event: annotated, not re-counted
+        counted.add(key)
+        if entry is None:
+            new_failures.append(failure)
+            continue
+        known += 1
+    report["known"] = known
+    report["new"] = len(new_failures)
+    report["tests"] = len(counted)
+    report["newFailures"] = new_failures
+    if counts is not None:
+        # `counts.failed` is authoritative while the inventory can be shorter
+        # (a reporter whose failure lines this parser does not recognise), so
+        # the gap is named instead of letting the split look complete.
+        report["unparsed"] = max(0, counts["failed"] - len(counted))
+    return report
+
+
+def summarize_with_baseline(
+    summary: str | None, report: BaselineReport | None
+) -> str | None:
+    """`83 passed, 4 failed` + ` (3 known, 1 new)` when a registry applies.
+
+    Only a summary that reports failures is annotated: "see log" means the run
+    was killed or the reporter was unrecognised, and its whole point is to not
+    claim a count. And the suffix is withheld when the split cannot be
+    reconciled with the count the summary already states (an inventory naming
+    more tests than `counts.failed`) — a one-liner that contradicts itself in the
+    same breath is worse than no hint at all.
+    """
+    if summary is None or report is None or report["error"] is not None:
+        return summary
+    if "failed" not in summary:
+        return summary
+    failed = report["failed"]
+    if failed is None or report["tests"] > failed:
+        return summary
+    known = report["known"]
+    new = report["new"]
+    unparsed = report["unparsed"]
+    if known + new + unparsed == 0:
+        return summary
+    parts = [f"{known} known", f"{new} new"]
+    if unparsed:
+        parts.append(f"{unparsed} unparsed")
+    return f"{summary} ({', '.join(parts)})"
 
 
 # ---------------------------------------------------------------------------
@@ -774,9 +1156,20 @@ def split_tool_body(body: dict[str, object]) -> dict[str, object]:
 class ToolHub:
     """Queue, worker thread and job registry."""
 
-    def __init__(self, cwd: str, log_dir: str) -> None:
+    def __init__(
+        self,
+        cwd: str,
+        log_dir: str,
+        dart_format_exe: str | None = None,
+        uncommitted_files_fn: Callable[[str], list[str]] | None = None,
+    ) -> None:
         self.cwd = cwd
         self.log_dir = log_dir
+        # The boot-scoped formatter pin and the scope's file source, both fixed
+        # for the life of the bridge: a request cannot retarget either, which is
+        # the same shape as the pinned cwd (ADR-0002).
+        self.dart_format_exe = dart_format_exe
+        self._uncommitted_files = uncommitted_files_fn or uncommitted_dart_files
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
         self._queue: queue.Queue[Job] = queue.Queue()
@@ -788,12 +1181,32 @@ class ToolHub:
 
     # ---- submission ----
 
-    def submit(self, cmd: str, args: list[str], message: str | None = None) -> Job:
+    def submit(
+        self,
+        cmd: str,
+        args: list[str],
+        message: str | None = None,
+        scope: str | None = None,
+    ) -> Job:
         argv = build_argv(cmd, args, message)
         validate(argv)
         return self._enqueue(
-            Job(argv, self.cwd, os.path.join(self.log_dir, "pending.log"))
+            Job(
+                argv,
+                self.cwd,
+                os.path.join(self.log_dir, "pending.log"),
+                scope=scope,
+            )
         )
+
+    def uncommitted_files(self) -> list[str]:
+        """The uncommitted `.dart` files a `scope` request narrows to.
+
+        Raises ValueError when git cannot answer (not a repository, no git on
+        PATH, a timeout), so the route can refuse the request instead of queueing
+        a job whose scope is silently empty.
+        """
+        return self._uncommitted_files(self.cwd)
 
     def submit_tool(
         self,
@@ -887,7 +1300,7 @@ class ToolHub:
     def _run_command(self, job: Job) -> None:
         env = make_job_env()
         try:
-            launch, extra_env = resolve_launch(job.argv)
+            launch, extra_env = resolve_launch(job.argv, self.dart_format_exe)
         except FileNotFoundError as error:
             job.status = "failed"
             job.exit_code = 127
@@ -919,6 +1332,14 @@ class ToolHub:
             job.summary = digest["summary"]
             job.counts = digest["counts"]
             job.failures = digest["failures"]
+            if is_test_run(job.argv):
+                # Read now, from the pinned cwd: the registry describes the
+                # project as it is at run time, and its absence is simply
+                # "nothing changes".
+                registry = load_known_failures(job.cwd)
+                report = baseline_report(job.failures, digest["counts"], registry)
+                job.baseline = report
+                job.summary = summarize_with_baseline(job.summary, report)
         except FileNotFoundError:
             job.status = "failed"
             job.exit_code = 127
@@ -940,7 +1361,25 @@ class ToolHub:
                     job.status = "killed"
 
 
-def resolve_launch(argv: list[str]) -> tuple[list[str], dict[str, str]]:
+def dart_format_target(argv: list[str], pin: str | None) -> str | None:
+    """The pinned dart executable for a `dart format` job, else None.
+
+    Routing keys on `format` being the *first* argument after `dart` — the shape
+    CI uses (`dart format --output=none --set-exit-if-changed <files>`) and the
+    only one a scoped job produces. Everything else keeps the PATH toolchain on
+    purpose: `dart analyze`/`test`/`pub` and every `flutter` command must match
+    the Flutter SDK installed here, not CI's.
+    """
+    if pin is None or len(argv) < 2:
+        return None
+    if command_name(argv[0]) != "dart" or argv[1] != "format":
+        return None
+    return pin
+
+
+def resolve_launch(
+    argv: list[str], dart_format_exe: str | None = None
+) -> tuple[list[str], dict[str, str]]:
     """Turns an allowlisted command into a real executable invocation.
 
     On Windows `flutter` and `dart` are `.bat` wrappers, which CreateProcess
@@ -949,8 +1388,21 @@ def resolve_launch(argv: list[str]) -> tuple[list[str], dict[str, str]]:
     launch the SDK's own `dart.exe` (with the flutter_tools snapshot for
     `flutter`), so that is what we call directly.
 
-    Returns the argv to launch plus environment additions.
+    ``dart_format_exe`` is the boot-time **format pin**: when it is set, a `dart
+    format` job launches *that* executable instead. It is an explicit path to a
+    real `dart.exe` (a standalone SDK, not a wrapper), so it needs neither the
+    `.bat` dance nor `FLUTTER_ROOT` — and it is checked here rather than trusted,
+    because a pin that has gone missing must fail the job loudly rather than fall
+    back to the formatter the pin exists to avoid.
+
+    Returns the argv to launch plus environment additions. Raises
+    FileNotFoundError.
     """
+    pin = dart_format_target(argv, dart_format_exe)
+    if pin is not None:
+        if not os.path.isfile(pin):
+            raise FileNotFoundError(f"pinned dart format executable is missing: {pin}")
+        return ([pin, *argv[1:]], {})
     exe = shutil.which(argv[0])
     if exe is None:
         raise FileNotFoundError(f"executable not found on PATH: {argv[0]}")
@@ -1141,6 +1593,135 @@ def build_argv(cmd: str, args: list[str], message: str | None) -> list[str]:
     return [cmd, "commit", "-m", message, *body]
 
 
+# ---------------------------------------------------------------------------
+# Uncommitted scope
+# ---------------------------------------------------------------------------
+
+
+def parse_porcelain(data: str) -> list[str]:
+    """The paths of files that are uncommitted in `git status --porcelain -z`.
+
+    The `-z` form is the one to parse: records are NUL-separated and paths are
+    never quoted, so a CJK filename arrives as itself instead of as a
+    `\\NNN`-escaped string (verified against git on Windows). A record is
+    ``XY <path>``; for a rename or copy the **destination comes first** and the
+    source path rides in the following bare record, which is skipped.
+
+    Deleted and ignored entries are dropped — the question a scope answers is
+    "which files can be formatted or analyzed right now", and neither can.
+    """
+    paths: list[str] = []
+    records = data.split("\0")
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if len(record) < 4:
+            continue
+        status, path = record[:2], record[3:]
+        if status == "??":
+            paths.append(path)
+            continue
+        if status == "!!":
+            continue
+        if status[0] in ("R", "C"):
+            index += 1  # the source path, not what is on disk now
+        if "D" in status or not path:
+            continue
+        paths.append(path)
+    return paths
+
+
+def run_git_status(cwd: str) -> str:
+    """`git status --porcelain -z --untracked-files=all` in the pinned cwd.
+
+    ``--no-optional-locks`` keeps it from refreshing the index: this runs while
+    the single worker may be running a `git` job of its own, and fighting over
+    `index.lock` would turn a read into a spurious failure. Raises ValueError
+    with git's own message.
+    """
+    try:
+        completed = subprocess.run(  # noqa: S603 - argv list, no shell
+            [
+                "git",
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ],
+            cwd=cwd,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            timeout=GIT_STATUS_TIMEOUT,
+            env=make_job_env(),
+            creationflags=CREATE_NO_WINDOW,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ValueError(
+            f"git status timed out after {GIT_STATUS_TIMEOUT:g}s"
+        ) from error
+    except OSError as error:
+        raise ValueError(f"git status could not run: {error}") from error
+    if completed.returncode != 0:
+        detail = (completed.stderr or b"").decode("utf-8", "replace").strip()
+        raise ValueError(
+            f"git status failed (exit {completed.returncode}): {detail or 'no detail'}"
+        )
+    return completed.stdout.decode("utf-8", "replace")
+
+
+def uncommitted_dart_files(
+    cwd: str, run_git: Callable[[str], str] | None = None
+) -> list[str]:
+    """The uncommitted `.dart` files under ``cwd``, sorted and deduplicated.
+
+    Staged, unstaged and untracked alike: "uncommitted" is the caller's word for
+    everything that is not in HEAD yet. Raises ValueError when git cannot answer.
+    """
+    status = (run_git or run_git_status)(cwd)
+    wanted = {
+        path for path in parse_porcelain(status) if path.endswith(SCOPE_FILE_SUFFIX)
+    }
+    return sorted(wanted)
+
+
+def scope_mode(cmd: str, args: list[str]) -> str | None:
+    """How a scope applies to this command: `expand`, `filter`, or None.
+
+    None means the command cannot be scoped at all and the route must refuse it,
+    rather than queue a job whose scope quietly did nothing.
+    """
+    if command_name(cmd) not in SCOPE_COMMANDS or not args:
+        return None
+    verb = args[0]
+    if verb in SCOPE_FILTER_VERBS:
+        return "filter"
+    if command_name(cmd) == "dart" and verb in SCOPE_EXPAND_VERBS:
+        return "expand"
+    return None
+
+
+def scope_refusal(cmd: str, args: list[str]) -> str:
+    """Why this command cannot take an uncommitted scope, and what can."""
+    verb = args[0] if args else ""
+    return (
+        f"scope is not supported for {cmd} {verb}".rstrip()
+        + " (scoped: dart format — it expands to the uncommitted files;"
+        " dart/flutter analyze and fix — they filter their output to them)"
+    )
+
+
+def path_filter_regex(paths: list[str]) -> re.Pattern[str]:
+    """A regex matching any of ``paths``, for filtering a tool's log lines.
+
+    Escaped, because a path is data: `.` must not match anything, and the
+    forward slashes git reports are exactly the form the analyzer prints.
+    """
+    return re.compile("|".join(re.escape(path) for path in paths))
+
+
 def make_handler(hub: ToolHub, token: str, status_url: str):
     class Handler(BaseHTTPRequestHandler):
         server_version = "toolhub/1.1"
@@ -1255,8 +1836,16 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
             if path == "/health":
                 # `tools` is the capability probe a client uses before calling a
                 # sub-tool route: a bridge deployed before this one answers with
-                # just {"ok": true}.
-                self._json(200, {"ok": True, "tools": list(TOOL_NAMES)})
+                # just {"ok": true}. `dartFormatExe` says whether this session's
+                # `dart format` jobs are pinned to another SDK (and which one).
+                self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "tools": list(TOOL_NAMES),
+                        "dartFormatExe": hub.dart_format_exe,
+                    },
+                )
                 return
             if path == "/":
                 if not self._authorized():
@@ -1336,13 +1925,54 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                 if message is not None and not isinstance(message, str):
                     self._error(400, "message must be a string")
                     return
+                scope = body.get("scope")
+                if scope is not None and not isinstance(scope, str):
+                    self._error(400, "scope must be a string")
+                    return
                 try:
                     tail, grep = parse_log_query(body.get("grep"), body.get("tail"))
                 except ValueError as error:
                     self._error(400, str(error))
                     return
+                if scope is not None:
+                    if scope != SCOPE_UNCOMMITTED:
+                        self._error(
+                            400,
+                            f"unknown scope: {scope!r} "
+                            f"(supported: {SCOPE_UNCOMMITTED})",
+                        )
+                        return
+                    if grep is not None:
+                        # Both are log filters with different owners; combining
+                        # them would need a lookahead pattern whose semantics
+                        # nobody could read off the response.
+                        self._error(400, "pass either grep or scope, not both")
+                        return
+                    mode = scope_mode(cmd, list(args))
+                    if mode is None:
+                        self._error(403, scope_refusal(cmd, list(args)))
+                        return
+                    try:
+                        # Computed here, at submit time, so "nothing uncommitted"
+                        # costs a 400 instead of a queued job that formats the
+                        # whole tree (which is what `dart format` with no paths
+                        # does).
+                        files = hub.uncommitted_files()
+                    except ValueError as error:
+                        self._error(400, str(error))
+                        return
+                    if not files:
+                        self._error(
+                            400,
+                            "no uncommitted .dart files to scope this command to",
+                        )
+                        return
+                    if mode == "expand":
+                        args = [*args, *files]
+                    else:
+                        grep = path_filter_regex(files)
                 try:
-                    job = hub.submit(cmd, list(args), message=message)
+                    job = hub.submit(cmd, list(args), message=message, scope=scope)
                 except ValueError as error:
                     self._error(403, str(error))
                     return
@@ -1572,6 +2202,47 @@ def selfcheck(timeout: float) -> bool:
     return True
 
 
+def format_pin_check(exe: str, timeout: float) -> bool:
+    """Runs ``<exe> --version`` so a misaimed formatter pin fails *at boot*.
+
+    The pin exists to make local formatting match CI's dart, and the whole
+    failure mode it prevents is silent: a pin pointed at the wrong SDK produces
+    plausible output and a red CI run. So the boot prints the version it is
+    going to format with, and refuses to start when it cannot read one.
+    """
+    eprint(f"TOOLHUB DART-FORMAT CHECK exe={exe}")
+    try:
+        completed = subprocess.run(  # noqa: S603 - argv list, no shell
+            [exe, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            env=make_job_env(),
+            creationflags=CREATE_NO_WINDOW,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        eprint(
+            f"TOOLHUB DART-FORMAT FAILED reason=timeout after={timeout:g}s exe={exe}"
+        )
+        return False
+    except OSError as error:
+        eprint(f"TOOLHUB DART-FORMAT FAILED reason={error!r} exe={exe}")
+        return False
+    output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    first_line = output.splitlines()[0] if output else "unknown"
+    if completed.returncode != 0:
+        eprint(
+            f"TOOLHUB DART-FORMAT FAILED reason=exit-{completed.returncode} "
+            f"exe={exe} output={output[:400]}"
+        )
+        return False
+    eprint(f"TOOLHUB DART-FORMAT OK exe={exe} version={first_line}")
+    return True
+
+
 def parent_alive(pid: int) -> bool:
     """Whether a process is still running, without signalling it.
 
@@ -1642,7 +2313,10 @@ def main() -> int:
         "--selfcheck",
         action="store_true",
         default=True,
-        help="run `flutter --version` before binding (default)",
+        help=(
+            "run the boot toolchain checks before binding: `flutter --version`, "
+            "plus `<exe> --version` for --dart-format when it is set (default)"
+        ),
     )
     parser.add_argument(
         "--no-selfcheck",
@@ -1693,19 +2367,42 @@ def main() -> int:
         default=None,
         help="directory for job logs (default: a fresh temp dir)",
     )
+    parser.add_argument(
+        "--dart-format",
+        dest="dart_format_exe",
+        default=None,
+        metavar="PATH",
+        help=(
+            "dart executable (dart.exe) used for `dart format` jobs — pin the "
+            "SDK whose version the project's CI formats with; every other "
+            "command keeps the PATH toolchain"
+        ),
+    )
     args = parser.parse_args()
 
     cwd = os.path.abspath(args.cwd)
     if not os.path.isdir(cwd):
         eprint(f"ERROR --cwd is not a directory: {cwd}")
         return 2
+    if args.dart_format_exe is not None:
+        # A pin that is not there is a usage error, not a job that fails later:
+        # the point of the flag is that `dart format` cannot pick the wrong dart.
+        args.dart_format_exe = os.path.abspath(args.dart_format_exe)
+        if not os.path.isfile(args.dart_format_exe):
+            parser.error(f"--dart-format is not a file: {args.dart_format_exe}")
     if args.selfcheck and not selfcheck(args.selfcheck_timeout):
+        return 1
+    if (
+        args.dart_format_exe is not None
+        and args.selfcheck
+        and not format_pin_check(args.dart_format_exe, args.selfcheck_timeout)
+    ):
         return 1
 
     log_dir = args.log_dir or tempfile.mkdtemp(prefix="toolhub-")
     os.makedirs(log_dir, exist_ok=True)
     token = args.token or secrets.token_urlsafe(24)
-    hub = ToolHub(cwd=cwd, log_dir=log_dir)
+    hub = ToolHub(cwd=cwd, log_dir=log_dir, dart_format_exe=args.dart_format_exe)
 
     # Startup tasks ("start it and kick off a build"): queued before the socket
     # opens, so a client sees them as already-pending work.

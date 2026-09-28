@@ -8,7 +8,9 @@ denies. Run them directly, from the project root or anywhere else:
 They read the fixtures under `tests/fixtures/` and write nothing, except the
 `arb-edit` job tests, which copy the ARB fixture tree into
 `tests/.tmp-arbtool/` and remove it again (a real edit has to land somewhere,
-and the sandbox permits writes inside the workspace).
+and the sandbox permits writes inside the workspace), plus two scratch
+directories for the formatter-pin and scope tests (`.tmp-format-pin/`,
+`.tmp-scope/`) — both removed by the tests that make them.
 """
 
 from __future__ import annotations
@@ -37,6 +39,15 @@ ARB_FIXTURES = FIXTURES / "arb"
 ARB_DIR = ARB_FIXTURES / "lib" / "l10n"
 ARB_SCRATCH = HERE / ".tmp-arbtool"
 ARB_LOG_SCRATCH = HERE / ".tmp-arbtool-logs"
+# The formatter pin needs a real file to point at (`resolve_launch` checks), and
+# a scoped `/run` job will spawn whatever `dart` resolves to, so its stray
+# output has a scratch directory of its own.
+PIN_SCRATCH = HERE / ".tmp-format-pin"
+SCOPE_SCRATCH = HERE / ".tmp-scope"
+SCOPE_LOG_SCRATCH = HERE / ".tmp-scope-logs"
+# The known-failure registry tests write a registry into a scratch cwd and read
+# it back exactly as a job does.
+REGISTRY_SCRATCH = HERE / ".tmp-registry"
 
 
 def load_server() -> types.ModuleType:
@@ -955,6 +966,38 @@ class ArbToolJobTests(unittest.TestCase):
         self.assertEqual(tool.to_json()["result"], {"edited": []})
 
 
+def http_call(
+    port: int,
+    token: str,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    auth: bool = True,
+) -> tuple[int, Any]:
+    """One request against a test server: `(status, decoded json)`.
+
+    An HTTP error is a normal answer here, not a test failure — the refusal
+    codes are the thing being pinned.
+    """
+    request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+    if auth:
+        request.add_header("Authorization", f"Bearer {token}")
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, data, timeout=30) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        # An HTTPError carries a socket too; leaving it to the garbage collector
+        # prints a ResourceWarning from inside the test run.
+        try:
+            return error.code, json.loads(error.read().decode("utf-8"))
+        finally:
+            error.close()
+
+
 class ArbToolRouteTests(unittest.TestCase):
     """The HTTP surface: auth, the 400 layer, and a dry-run job end to end.
 
@@ -966,12 +1009,19 @@ class ArbToolRouteTests(unittest.TestCase):
     """
 
     TOKEN = "route-test-token"
+    # A pin is a plain boot-time path; `/health` only reports it, so a fake one
+    # is enough to show the wiring without needing an SDK installed.
+    PIN = r"C:\pinned\dart.exe"
 
     @classmethod
     def setUpClass(cls) -> None:
         shutil.rmtree(ARB_LOG_SCRATCH, ignore_errors=True)
         ARB_LOG_SCRATCH.mkdir(parents=True)
-        cls.hub = server.ToolHub(cwd=str(ARB_FIXTURES), log_dir=str(ARB_LOG_SCRATCH))
+        cls.hub = server.ToolHub(
+            cwd=str(ARB_FIXTURES),
+            log_dir=str(ARB_LOG_SCRATCH),
+            dart_format_exe=cls.PIN,
+        )
         cls.httpd = server.ThreadingHTTPServer(
             ("127.0.0.1", 0), server.make_handler(cls.hub, cls.TOKEN, "")
         )
@@ -994,20 +1044,7 @@ class ArbToolRouteTests(unittest.TestCase):
         body: dict[str, Any] | None = None,
         auth: bool = True,
     ) -> tuple[int, Any]:
-        request = urllib.request.Request(
-            f"http://127.0.0.1:{self.port}{path}", method=method
-        )
-        if auth:
-            request.add_header("Authorization", f"Bearer {self.TOKEN}")
-        data = None
-        if body is not None:
-            data = json.dumps(body).encode("utf-8")
-            request.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(request, data, timeout=30) as response:
-                return response.status, json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            return error.code, json.loads(error.read().decode("utf-8"))
+        return http_call(self.port, self.TOKEN, method, path, body, auth)
 
     def fixture_bytes(self) -> dict[str, bytes]:
         return {path.name: path.read_bytes() for path in sorted(ARB_DIR.glob("*.arb"))}
@@ -1017,6 +1054,9 @@ class ArbToolRouteTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["tools"], ["arb-edit"])
+        # The formatter pin is a capability too: a client checks it here rather
+        # than parsing the boot output it never saw.
+        self.assertEqual(payload["dartFormatExe"], self.PIN)
 
     def test_unknown_tool_is_404_even_with_a_body(self) -> None:
         status, payload = self.call("POST", "/tools/nope", {"groups": []})
@@ -1128,6 +1168,573 @@ class ArbToolRouteTests(unittest.TestCase):
         _, fetched = self.call("GET", f"/jobs/{job['id']}?tail=20")
         self.assertIn("DRY RUN", fetched["tail"])
         self.assertEqual(fetched["result"], job["result"])
+
+
+class DartFormatPinTests(unittest.TestCase):
+    """`dart format` jobs run the pinned SDK; nothing else does.
+
+    The pin exists because CI's dart and the locally installed one format
+    differently, so formatting here with the local one is exactly what turns
+    CI's `dart format --set-exit-if-changed` check red.
+    """
+
+    PIN = r"D:\Tools\dart-3.12.2\bin\dart.exe"
+
+    def test_only_dart_format_routes(self) -> None:
+        for argv in (
+            ["dart", "format"],
+            ["dart", "format", "lib"],
+            ["dart", "format", "--output=none", "--set-exit-if-changed", "lib/a.dart"],
+            [r"D:\Tools\flutter\bin\dart.bat", "format", "lib"],
+            ["dart.exe", "format"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(server.dart_format_target(argv, self.PIN), self.PIN)
+        for argv in (
+            ["dart"],
+            ["dart", "analyze", "lib"],
+            ["dart", "test"],
+            ["dart", "pub", "get"],
+            ["dart", "run", "tool/generate.dart"],
+            ["dart", "--version"],
+            ["flutter", "format", "lib"],
+            ["git", "status"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(server.dart_format_target(argv, self.PIN))
+
+    def test_without_a_pin_nothing_routes(self) -> None:
+        self.assertIsNone(server.dart_format_target(["dart", "format"], None))
+
+    def test_resolve_launch_swaps_in_the_pin(self) -> None:
+        shutil.rmtree(PIN_SCRATCH, ignore_errors=True)
+        PIN_SCRATCH.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, PIN_SCRATCH, True)
+        fake = PIN_SCRATCH / "dart.exe"
+        fake.write_bytes(b"")
+        launch, extra_env = server.resolve_launch(
+            ["dart", "format", "--output=none", "lib/a.dart"], str(fake)
+        )
+        self.assertEqual(launch, [str(fake), "format", "--output=none", "lib/a.dart"])
+        # A standalone dart is a real executable: no `.bat` unwrapping, and no
+        # FLUTTER_ROOT to add.
+        self.assertEqual(extra_env, {})
+
+    def test_a_missing_pin_fails_loudly(self) -> None:
+        """Falling back to the PATH dart would be the bug the pin prevents."""
+        gone = str(PIN_SCRATCH / "gone.exe")
+        with self.assertRaises(FileNotFoundError) as caught:
+            server.resolve_launch(["dart", "format", "lib"], gone)
+        self.assertIn("pinned dart format executable is missing", str(caught.exception))
+
+
+class UncommittedScopeTests(unittest.TestCase):
+    """What `scope: "uncommitted"` selects, and how it applies per verb."""
+
+    # Captured from `git status --porcelain=v1 -z --untracked-files=all` in a
+    # scratch repo holding a modified, a deleted, a renamed, an untracked, an
+    # ignored and a staged file. The rename record is the fact worth pinning:
+    # the destination comes *first* and the source path follows as its own bare
+    # record (verified against git on Windows).
+    PORCELAIN = (
+        " M a.dart\0 D c.dart\0R  renamed.dart\0b.dart\0?? untracked.dart\0"
+        "!! ignored.dart\0A  staged.dart\0"
+    )
+
+    def test_porcelain_selects_what_exists_and_is_uncommitted(self) -> None:
+        self.assertEqual(
+            server.parse_porcelain(self.PORCELAIN),
+            ["a.dart", "renamed.dart", "untracked.dart", "staged.dart"],
+        )
+
+    def test_paths_are_never_quoted_or_escaped(self) -> None:
+        """`-z` hands over a CJK path as itself, not as \\NNN escapes."""
+        self.assertEqual(
+            server.parse_porcelain("?? lib/中文 名字.dart\0"), ["lib/中文 名字.dart"]
+        )
+
+    def test_only_dart_files_are_scoped(self) -> None:
+        self.assertEqual(
+            server.uncommitted_dart_files("unused", run_git=lambda cwd: self.PORCELAIN),
+            ["a.dart", "renamed.dart", "staged.dart", "untracked.dart"],
+        )
+
+    def test_git_cannot_answer_is_refused(self) -> None:
+        """A directory git cannot run in is an error, never an empty scope."""
+        missing = str(HERE / ".tmp-scope-not-here")
+        with self.assertRaises(ValueError):
+            server.uncommitted_dart_files(missing)
+
+    def test_scope_mode_per_verb(self) -> None:
+        self.assertEqual(server.scope_mode("dart", ["format", "lib"]), "expand")
+        for cmd, verb in (
+            ("dart", "analyze"),
+            ("flutter", "analyze"),
+            ("dart", "fix"),
+            ("flutter", "fix"),
+        ):
+            with self.subTest(cmd=cmd, verb=verb):
+                self.assertEqual(server.scope_mode(cmd, [verb]), "filter")
+        for cmd, verb in (
+            ("dart", "test"),
+            ("flutter", "test"),
+            ("dart", "pub"),
+            ("git", "status"),
+        ):
+            with self.subTest(cmd=cmd, verb=verb):
+                self.assertIsNone(server.scope_mode(cmd, [verb]))
+        self.assertIsNone(server.scope_mode("dart", []))
+
+    def test_filter_regex_matches_paths_not_prefixes(self) -> None:
+        pattern = server.path_filter_regex(["lib/a.dart", "test/b_test.dart"])
+        self.assertIsNotNone(pattern.search("   info • unused • lib/a.dart:3:1"))
+        self.assertIsNone(pattern.search("   info • unused • lib/ab.dart:3:1"))
+
+    def test_job_json_carries_the_scope(self) -> None:
+        scoped = server.Job(
+            ["dart", "format", "a.dart"], ".", os.devnull, scope="uncommitted"
+        )
+        self.assertEqual(scoped.to_json()["scope"], "uncommitted")
+        plain = server.Job(["dart", "format"], ".", os.devnull)
+        self.assertIsNone(plain.to_json()["scope"])
+
+
+class ScopeRouteTests(unittest.TestCase):
+    """`scope` on `/run`: refusals at submit time, expansion on the job.
+
+    The file list is injected, so nothing here depends on git or on the repo's
+    own state — the contract being pinned is the transport: what is refused,
+    what the queued argv looks like, and that a refusal queues nothing.
+    """
+
+    TOKEN = "scope-test-token"
+    FILES: ClassVar[list[str]] = ["lib/scoped_a.dart", "lib/scoped_b.dart"]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        shutil.rmtree(SCOPE_LOG_SCRATCH, ignore_errors=True)
+        shutil.rmtree(SCOPE_SCRATCH, ignore_errors=True)
+        SCOPE_LOG_SCRATCH.mkdir(parents=True)
+        SCOPE_SCRATCH.mkdir()
+        cls.files: list[str] = list(cls.FILES)
+        cls.git_error: str | None = None
+
+        def fake_uncommitted(cwd: str) -> list[str]:
+            if cls.git_error is not None:
+                raise ValueError(cls.git_error)
+            return list(cls.files)
+
+        cls.hub = server.ToolHub(
+            cwd=str(SCOPE_SCRATCH),
+            log_dir=str(SCOPE_LOG_SCRATCH),
+            uncommitted_files_fn=fake_uncommitted,
+        )
+        cls.httpd = server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), server.make_handler(cls.hub, cls.TOKEN, "")
+        )
+        cls.httpd.daemon_threads = True
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.hub.stop()
+        shutil.rmtree(SCOPE_LOG_SCRATCH, ignore_errors=True)
+        shutil.rmtree(SCOPE_SCRATCH, ignore_errors=True)
+
+    def setUp(self) -> None:
+        type(self).files = list(self.FILES)
+        type(self).git_error = None
+
+    def call(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        auth: bool = True,
+    ) -> tuple[int, Any]:
+        return http_call(self.port, self.TOKEN, method, path, body, auth)
+
+    def test_dart_format_gets_the_files_appended(self) -> None:
+        status, job = self.call(
+            "POST",
+            "/run",
+            {
+                "cmd": "dart",
+                "args": ["format", "--output=none"],
+                "scope": "uncommitted",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(job["scope"], "uncommitted")
+        self.assertEqual(job["argv"], ["dart", "format", "--output=none", *self.FILES])
+
+    def test_analyze_keeps_its_argv_and_filters_the_log(self) -> None:
+        status, job = self.call(
+            "POST",
+            "/run",
+            {"cmd": "dart", "args": ["analyze", "lib"], "scope": "uncommitted"},
+        )
+        self.assertEqual(status, 200)
+        # The analyzer accepts a directory, never a file list: argv is untouched
+        # and the narrowing happens on the returned lines.
+        self.assertEqual(job["argv"], ["dart", "analyze", "lib"])
+        self.assertIn("lib/scoped_a\\.dart", job["log"]["grep"])
+
+    def test_unknown_scope_is_a_400(self) -> None:
+        before = len(self.hub.list_jobs())
+        status, payload = self.call(
+            "POST",
+            "/run",
+            {"cmd": "dart", "args": ["format"], "scope": "staged"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("unknown scope", payload["error"])
+        self.assertEqual(len(self.hub.list_jobs()), before)
+
+    def test_scope_must_be_a_string(self) -> None:
+        status, payload = self.call(
+            "POST", "/run", {"cmd": "dart", "args": ["format"], "scope": 7}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("scope must be a string", payload["error"])
+
+    def test_scope_with_grep_is_a_400(self) -> None:
+        status, payload = self.call(
+            "POST",
+            "/run",
+            {
+                "cmd": "dart",
+                "args": ["format"],
+                "scope": "uncommitted",
+                "grep": "lib/",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("either grep or scope", payload["error"])
+
+    def test_an_unscopable_command_is_a_403(self) -> None:
+        before = len(self.hub.list_jobs())
+        for cmd, args in (
+            ("git", ["status"]),
+            ("dart", ["test"]),
+            ("flutter", ["test"]),
+        ):
+            with self.subTest(cmd=cmd, args=args):
+                status, payload = self.call(
+                    "POST",
+                    "/run",
+                    {"cmd": cmd, "args": args, "scope": "uncommitted"},
+                )
+                self.assertEqual(status, 403)
+                self.assertIn("scope is not supported", payload["error"])
+        self.assertEqual(len(self.hub.list_jobs()), before)
+
+    def test_an_empty_uncommitted_set_is_a_400(self) -> None:
+        """`dart format` with no paths rewrites the whole tree — never do that."""
+        type(self).files = []
+        before = len(self.hub.list_jobs())
+        status, payload = self.call(
+            "POST",
+            "/run",
+            {
+                "cmd": "dart",
+                "args": ["format", "--output=none"],
+                "scope": "uncommitted",
+            },
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("no uncommitted .dart files", payload["error"])
+        self.assertEqual(len(self.hub.list_jobs()), before)
+
+    def test_a_git_failure_is_a_400(self) -> None:
+        failure = "git status failed (exit 128): fatal: not a git repository"
+        type(self).git_error = failure
+        before = len(self.hub.list_jobs())
+        status, payload = self.call(
+            "POST", "/run", {"cmd": "dart", "args": ["format"], "scope": "uncommitted"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("not a git repository", payload["error"])
+        self.assertEqual(len(self.hub.list_jobs()), before)
+
+
+class KnownFailureRegistryTests(unittest.TestCase):
+    """The known-failure registry: what it claims, and how the digest reads it.
+
+    The registry answers "is this failure mine?" for a project that has already
+    written its pre-existing failures down (platform-specific, flaky, ...). The
+    two directions must stay distinguishable: a matched failure is annotated and
+    lands in the split's `known` count, an unmatched one is *named* in
+    `newFailures`, and a registry that cannot be read claims neither.
+    """
+
+    FLUTTER_TEST: ClassVar[list[str]] = ["flutter", "test", "test/desktop"]
+
+    def setUp(self) -> None:
+        shutil.rmtree(REGISTRY_SCRATCH, ignore_errors=True)
+        REGISTRY_SCRATCH.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(REGISTRY_SCRATCH, ignore_errors=True)
+
+    def write_registry(self, document: object) -> None:
+        """Writes the registry, raw when a string (for malformed-document tests)."""
+        target = REGISTRY_SCRATCH / ".toolbridge"
+        target.mkdir(parents=True, exist_ok=True)
+        text = document if isinstance(document, str) else json.dumps(document)
+        (target / "known-failures.json").write_text(text, encoding="utf-8")
+
+    def digest(self, name: str = "expanded_failed.txt") -> Mapping[str, Any]:
+        return server.analyze_test_log(self.FLUTTER_TEST, fixture(name))
+
+    def split(self, document: object, log: str = "expanded_failed.txt") -> Any:
+        """The whole pipeline: log → digest → registry → annotated split."""
+        self.write_registry(document)
+        digest = self.digest(log)
+        registry = server.load_known_failures(str(REGISTRY_SCRATCH))
+        report = server.baseline_report(digest["failures"], digest["counts"], registry)
+        assert report is not None
+        return (
+            digest,
+            registry,
+            report,
+            server.summarize_with_baseline(digest["summary"], report),
+        )
+
+    def test_without_a_registry_nothing_changes(self) -> None:
+        digest = self.digest()
+        registry = server.load_known_failures(str(REGISTRY_SCRATCH))
+        self.assertFalse(registry["exists"])
+        self.assertIsNone(
+            server.baseline_report(digest["failures"], digest["counts"], registry)
+        )
+        self.assertEqual(
+            server.summarize_with_baseline(digest["summary"], None),
+            "83 passed, 6 failed",
+        )
+
+    def test_entries_claim_failures_by_name_and_by_regex(self) -> None:
+        digest, _, report, summary = self.split(
+            {
+                "entries": [
+                    {
+                        "name": "alpha refuses a bad key",
+                        "kind": "platform",
+                        "platform": server.current_platform(),
+                        "reason": "Windows-only: path separator",
+                    },
+                    {"match": r"^(bravo|delta) ", "kind": "flaky", "reason": "timing"},
+                ]
+            }
+        )
+        self.assertEqual(report["known"], 3)
+        self.assertEqual(report["new"], 3)
+        self.assertEqual(
+            [entry["name"] for entry in report["newFailures"]],
+            ["gamma restores state", "epsilon syncs", "zeta handles empty"],
+        )
+        self.assertEqual(
+            digest["failures"][0]["known"],
+            {"kind": "platform", "reason": "Windows-only: path separator"},
+        )
+        self.assertNotIn("known", digest["failures"][2])
+        self.assertEqual(summary, "83 passed, 6 failed (3 known, 3 new)")
+
+    def test_platform_gating_skips_the_other_os(self) -> None:
+        """A Windows-only entry must not silence a failure on CI's Linux."""
+        other = "posix" if server.IS_WINDOWS else "windows"
+        _, _, elsewhere, _ = self.split(
+            {"entries": [{"name": "alpha refuses a bad key", "platform": other}]}
+        )
+        self.assertEqual(elsewhere["known"], 0)
+        self.assertEqual(elsewhere["newFailures"][0]["name"], "alpha refuses a bad key")
+        _, _, here, _ = self.split(
+            {
+                "entries": [
+                    {
+                        "name": "alpha refuses a bad key",
+                        "platform": server.current_platform(),
+                        "kind": "platform",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(here["known"], 1)
+
+    def test_file_narrows_an_entry_to_one_suite(self) -> None:
+        _, _, right, _ = self.split(
+            {
+                "entries": [
+                    {
+                        "file": "test/desktop/alpha_test.dart",
+                        "name": "alpha refuses a bad key",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(right["known"], 1)
+        _, _, wrong, _ = self.split(
+            {
+                "entries": [
+                    {
+                        "file": "test/other/alpha_test.dart",
+                        "name": "alpha refuses a bad key",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(wrong["known"], 0)
+
+    def test_a_windows_style_reported_path_still_matches(self) -> None:
+        """The reporter's absolute, mixed-separator path is normalised, not typed."""
+        entries = server.parse_known_failures(
+            {"entries": [{"file": "test/desktop/alpha_test.dart", "name": "alpha x"}]}
+        )
+        failure: dict[str, Any] = {
+            "file": r"C:\WS\test\desktop\alpha_test.dart",
+            "name": "alpha x",
+            "didNotComplete": False,
+        }
+        self.assertIsNotNone(server.known_entry_for(entries, failure))
+        failure["file"] = r"C:\WS\test\other\alpha_test.dart"
+        self.assertIsNone(server.known_entry_for(entries, failure))
+
+    def test_the_first_matching_entry_wins(self) -> None:
+        _, _, report, _ = self.split(
+            {
+                "entries": [
+                    {"match": "alpha", "kind": "flaky", "reason": "first"},
+                    {"match": "alpha", "kind": "platform", "reason": "second"},
+                ]
+            }
+        )
+        self.assertEqual(report["known"], 1)
+        self.assertEqual(report["newFailures"][0]["name"], "bravo retries once")
+
+    def test_a_shorter_inventory_is_reported_as_unparsed(self) -> None:
+        """`counts.failed` is authoritative; the split must not look complete."""
+        self.write_registry({"entries": [{"name": "alpha refuses a bad key"}]})
+        digest = self.digest()
+        registry = server.load_known_failures(str(REGISTRY_SCRATCH))
+        report = server.baseline_report(
+            digest["failures"][:4], digest["counts"], registry
+        )
+        assert report is not None
+        self.assertEqual(report["unparsed"], 2)
+        self.assertEqual(
+            server.summarize_with_baseline(digest["summary"], report),
+            "83 passed, 6 failed (1 known, 3 new, 2 unparsed)",
+        )
+
+    def test_a_broken_registry_claims_nothing_and_says_so(self) -> None:
+        self.write_registry("{ not json")
+        digest = self.digest()
+        registry = server.load_known_failures(str(REGISTRY_SCRATCH))
+        self.assertTrue(registry["exists"])
+        self.assertIsNotNone(registry["error"])
+        report = server.baseline_report(digest["failures"], digest["counts"], registry)
+        assert report is not None
+        self.assertEqual(report["known"], 0)
+        self.assertEqual(report["new"], 6)
+        self.assertEqual(report["error"], registry["error"])
+        self.assertNotIn("known", digest["failures"][0])
+        # No split is claimed in the summary either: the one-liner must not read
+        # as "all known" when the registry never loaded.
+        self.assertEqual(
+            server.summarize_with_baseline(digest["summary"], report),
+            "83 passed, 6 failed",
+        )
+
+    def test_schema_errors_name_the_entry(self) -> None:
+        cases: tuple[tuple[object, str], ...] = (
+            ("[]", "must be a JSON object"),
+            ({"entries": {}}, "needs an 'entries' list"),
+            ({"entries": [7]}, "entries[0] must be an object"),
+            ({"entries": [{}]}, "needs exactly one of 'name' or 'match'"),
+            ({"entries": [{"name": "x", "match": "y"}]}, "exactly one"),
+            ({"entries": [{"name": "x", "kind": "mystery"}]}, "kind must be one of"),
+            ({"entries": [{"name": "x", "platform": "linux"}]}, "platform must be"),
+            ({"entries": [{"match": "([", "kind": "flaky"}]}, "not a valid regex"),
+            ({"entries": [{"name": "x", "reason": 5}]}, "reason must be a string"),
+            ({"entries": [{"name": 5}]}, "name must be a string"),
+        )
+        for document, expected in cases:
+            with self.subTest(document=document):
+                self.write_registry(document)
+                registry = server.load_known_failures(str(REGISTRY_SCRATCH))
+                self.assertIn(expected, registry["error"] or "")
+
+    def test_a_passing_run_is_never_annotated(self) -> None:
+        _, _, report, summary = self.split(
+            {"entries": [{"match": ".*"}]}, log="expanded_passed.txt"
+        )
+        self.assertEqual(report["known"], 0)
+        self.assertEqual(summary, "33 passed, 2 skipped")
+
+    def test_a_test_that_reports_twice_is_counted_once(self) -> None:
+        """A failure in the body *and* in tearDown prints two `[E]` lines.
+
+        Observed on a real run: 79 `[E]` lines covered 77 failing tests, which
+        made a naive split contradict the count the summary leads with.
+        """
+        self.write_registry({"entries": [{"name": "alpha refuses a bad key"}]})
+        digest = self.digest()
+        alpha = next(
+            e for e in digest["failures"] if e["name"] == "alpha refuses a bad key"
+        )
+        failures = [*digest["failures"], dict(alpha)]
+        registry = server.load_known_failures(str(REGISTRY_SCRATCH))
+        report = server.baseline_report(failures, digest["counts"], registry)
+        assert report is not None
+        self.assertEqual(report["events"], 7)
+        self.assertEqual(report["tests"], 6)
+        self.assertEqual(report["failed"], 6)
+        self.assertEqual(report["known"], 1)
+        self.assertEqual(report["new"], 5)
+        self.assertEqual(report["unparsed"], 0)
+        # Every event is annotated, the duplicate included: an event that lost
+        # its `known` would read as new.
+        self.assertTrue(all("known" in e for e in failures[:1] + [failures[-1]]))
+        self.assertEqual(
+            server.summarize_with_baseline(digest["summary"], report),
+            "83 passed, 6 failed (1 known, 5 new)",
+        )
+
+    def test_an_unreconcilable_inventory_keeps_the_summary_plain(self) -> None:
+        """More named tests than `counts.failed` states: claim no split at all."""
+        self.write_registry({"entries": [{"name": "alpha refuses a bad key"}]})
+        digest = self.digest()
+        registry = server.load_known_failures(str(REGISTRY_SCRATCH))
+        report = server.baseline_report(
+            digest["failures"],
+            {"passed": 83, "skipped": 0, "failed": 3},
+            registry,
+        )
+        assert report is not None
+        self.assertEqual(report["tests"], 6)
+        self.assertEqual(report["failed"], 3)
+        self.assertEqual(report["unparsed"], 0)
+        self.assertEqual(
+            server.summarize_with_baseline(digest["summary"], report),
+            "83 passed, 6 failed",
+        )
+
+    def test_the_baseline_rides_with_the_log_view_only(self) -> None:
+        job = server.Job(["flutter", "test"], ".", os.devnull)
+        job.baseline = {
+            "source": ".toolbridge/known-failures.json",
+            "known": 1,
+            "new": 0,
+            "unparsed": 0,
+            "newFailures": [],
+            "error": None,
+        }
+        self.assertNotIn("baseline", job.to_json())
+        self.assertIn("baseline", job.to_json(tail_lines=5))
 
 
 if __name__ == "__main__":

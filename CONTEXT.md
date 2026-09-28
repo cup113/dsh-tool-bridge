@@ -34,6 +34,22 @@ _Avoid_: protection, isolation, containment
 The one working directory fixed at boot; every job runs there and no request can change it.
 _Avoid_: workspace root (the cwd is usually the workspace, but that is a coincidence, not the definition)
 
+**Format pin**:
+The dart executable fixed at boot by `--dart-format` that `dart format` **Jobs** run instead of the PATH one, so a session formats with the version a project's CI formats with — formatting with a newer local dart is what turns CI's `--set-exit-if-changed` check red.
+_Avoid_: per-request exe, SDK override, toolchain pin (too broad: `dart analyze`/`test`/`pub` deliberately keep the PATH toolchain)
+
+**Uncommitted scope**:
+The `/run` field `scope: "uncommitted"`: the **Pinned cwd**'s uncommitted `.dart` files (staged, unstaged and untracked; deleted and ignored excluded), read once at submit time. `dart format` receives them as trailing paths — the **Expansion**; `analyze` and `fix` accept at most one directory, so there the same set narrows the returned log lines — the **Filter**.
+_Avoid_: changed files (that is CI's commit range, not the working tree), diff scope, git scope
+
+**Expansion**:
+How the **Uncommitted scope** reaches `dart format`: the files are appended to the **Job**'s argv, so the formatter itself is narrowed — the local shape of CI's changed-files format check.
+_Avoid_: injection, argv rewriting
+
+**Filter**:
+How the **Uncommitted scope** reaches `analyze` and `fix`: `analyze` takes at most one directory and `fix` takes no path at all, so no argv can name a file set and the scope narrows the *returned* log lines instead; the exit code still describes the whole project.
+_Avoid_: narrowing, subset run (it is not a run over a subset)
+
 ### Work
 
 **Job**:
@@ -104,6 +120,14 @@ _Avoid_: commit body, message file, `-F` file
 Deciding whether a failing test was already failing before the caller's change — the question "is this failure mine?".
 _Avoid_: regression bisect, blame
 
+**Known-failure registry**:
+The optional `<cwd>/.toolbridge/known-failures.json` that answers **Baseline attribution** from data instead of memory: an entry claims a failure by test name or regex, optionally narrowed by suite (`file`) and `platform`, and carries a `kind` and a `reason`.
+_Avoid_: ignore list, suppression (an entry explains a failure, it never hides one), baseline file
+
+**Baseline report**:
+The digest field carrying the split — `source`, the `known`/`new` counts over **distinct tests**, `failed` (the authoritative **Counts** number they must reconcile with), `tests`/`events` (distinct tests vs `[E]` lines), `unparsed`, and `newFailures`, the complete ordered list of the failures the registry did **not** claim. It rides with the log view, so `/jobs` shows only the `summary` suffix.
+_Avoid_: report (that is a sub-tool's `result`), diff, regression list
+
 **Backup-and-restore**:
 The sanctioned baseline-attribution recipe: copy the dirty files to a scratch directory inside the workspace, `git restore -- <paths>`, run the job, copy the files back.
 _Avoid_: stash (a different, deliberately absent mechanism), revert
@@ -111,6 +135,10 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 ## Relationships
 
 - One **Bridge** serves one session and owns one **Queue** and one **Pinned cwd**.
+- A **Format pin** is boot-scoped like the **Pinned cwd**: no request can retarget either.
+- An **Uncommitted scope** is computed once, at submit time; an empty one is refused, because `dart format` with no paths rewrites the whole tree.
+- A **Known-failure registry** is read per **Job** from the **Pinned cwd**; with no registry a **Digest** is exactly what it was before the feature.
+- A **Baseline report** names the new failures; the `summary` suffix only counts them, so "which ones" is never read off the one-liner.
 - A **Sub-tool** is a **Job**: it queues, logs and is killed like any other, and its **`result`** is what a **Digest** cannot express.
 - A **Sub-tool** runs in the **Pinned cwd** like everything else; its body carries no `cwd`.
 - A **Bridge** is started by exactly one **Escalation**; every job after that costs none, so the **Escalation count** is normally 1.
@@ -129,6 +157,10 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 > **Maintainer:** "That's a truncated digest: four entries, alphabetical, and `-r failures-only` doesn't print it at all. The **failure inventory** is the `[E]` lines; the block only lends a path."
 > **Dev:** "If a fix looks wrong, can I run the test at the parent commit to check?"
 > **Maintainer:** "For your own uncommitted work, use **backup-and-restore** — copy, `git restore -- <paths>`, run, copy back. For a *different* commit there is no entry; the **Pinned cwd** is deliberate (ADR-0002)."
+> **Dev:** "CI says my files are unformatted and `dart format` disagrees. So I format with CI's older dart?"
+> **Maintainer:** "With a **Format pin**: one boot flag, and `dart format` jobs run that SDK while everything else keeps the local one. The pin is boot-scoped like the **Pinned cwd**, so a session cannot quietly format with the wrong dart."
+> **Dev:** "Then `scope: uncommitted` on `dart analyze` analyzes only my files?"
+> **Maintainer:** "It cannot — the analyzer takes a directory, not a file list. That request is a **Filter**: your files' lines come back, but the exit code still describes the whole project. Only `dart format` takes an **Expansion**."
 
 ## Flagged ambiguities
 
@@ -140,3 +172,6 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 - "arbitrary command execution is absent" (README) — resolved: it is absent as *an accepted executable name*, not as a capability; `dart` runs any Dart source in the workspace (ADR-0001).
 - "sub-tool" / "子 tool" — resolved: a named operation executed as a **Job** with a structured **`result`** (ADR-0003), not a second execution path and not a DSH plugin; the first member is `arb-edit`, which retired the standalone `flutter-arb-edit` skill.
 - "validation" for an ARB instruction — resolved: two different things with two different answers. Schema checks are a **400** at submit time; anchor/range problems happen in the **Plan phase** and fail the job with zero files written.
+- "scope: uncommitted for analyze" — resolved: it is a **Filter**, not an **Expansion**. `dart analyze` accepts at most one directory, so the run still covers the whole project and only the returned lines are narrowed; a pre-existing issue in an untouched file still fails the exit code.
+- "changed files" was used for the **Uncommitted scope** — resolved: they are different sets. CI compares two commits (untracked files cannot exist there); the scope reads the working tree, untracked files included.
+- "the summary says which failures are new" — resolved: it never does. The suffix counts known/new; **which** is `baseline.newFailures`, and a **Known-failure registry** that cannot be read claims nothing rather than counting everything as known.

@@ -8,6 +8,14 @@ approval per command. It also serializes jobs (concurrent Flutter runs fight
 over `build/`), captures UTF-8 logs, filters them server-side, digests
 `flutter test` results, and can kill a hung job's whole process tree.
 
+Two knobs keep a local run comparable with CI's: `--dart-format` routes `dart
+format` jobs to the dart a project's CI formats with (a newer local SDK formats
+differently, which turns CI's format check red), and `"scope":
+"uncommitted"` on `/run` narrows a command to the working tree's uncommitted
+`.dart` files — the set CI format-checks. A test job also reads the project's
+optional `.toolbridge/known-failures.json` and splits its failures into known
+and new, so a red local run can be read instead of re-diagnosed.
+
 Sub-tools are named operations that run as jobs. The first is
 `POST /tools/arb-edit`: it applies ARB localization edits, runs `flutter
 gen-l10n` and reports the untranslated-messages-file — the sequence the
@@ -24,6 +32,15 @@ python -u D:\Projects\dsh-tool-bridge\scripts\toolhub_server.py `
 Started plainly it fails its boot self-check on purpose (the sandbox denies the
 SDK lockfile write); that failure is the evidence for retrying the same command
 with `danger-full-access`. See the skill for the API and the client snippets.
+
+To format with the dart a project's CI pins — the boot prints the version it
+will use, and `/health` reports it as `dartFormatExe`:
+
+```powershell
+python -u D:\Projects\dsh-tool-bridge\scripts\toolhub_server.py `
+  --cwd "D:\Projects\kelivo" --watch-parent `
+  --dart-format D:\Tools\dart-3.12.2\bin\dart.exe
+```
 
 At boot it opens the tokenised status page in the default browser: this thing is
 normally launched by an agent as a background job that never exits, so the URL
@@ -66,3 +83,8 @@ only `SKILL.md` and the server.
 - A queue-aware early return from `/run`: `wait:false` already expresses it, and
   returning `queued` immediately whenever the queue is non-empty would force
   polling for the common case.
+- A per-request formatter or SDK override, and a scope for anything but `dart
+  format` (an **Expansion**), `dart`/`flutter` `analyze` and `fix` (a
+  **Filter**). The pin is boot-scoped, like the pinned cwd; a request that could
+  retarget the toolchain would just be a slower way to format with the wrong
+  dart.

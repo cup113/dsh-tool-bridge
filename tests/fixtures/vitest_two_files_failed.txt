@@ -1,0 +1,36 @@
+
+ RUN  v5.0.3 C:/ws
+
+ ✓ src/Util.test.ts (2 tests) 2ms
+ ❯ src/App.test.ts (2 tests | 1 failed) 6ms
+   ❯ add (2)
+     ✓ adds 1ms
+     × fails on purpose 4ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/App.test.ts > add > fails on purpose
+AssertionError: expected 3 to be 4 // Object.is equality
+
+- Expected
++ Received
+
+- 4
++ 3
+
+ ❯ src/App.test.ts:12:23
+     10|   });
+     11|   it('fails on purpose', () => {
+     12|     expect(add(1, 2)).toBe(4);
+       |                       ^
+     13|   });
+     14| });
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯
+
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 3 passed (4)
+   Start at  13:54:18
+   Duration  698ms (environment 95%, transform 2%, import 2%, tests 1%, worker 1%)
+

@@ -4,22 +4,31 @@
 
 A session-scoped, loopback-only toolchain server for **file-sandboxed agent
 sessions**. It is started once with one elevated approval and then runs
-`flutter`/`dart` (any subcommand), a guard-railed `git` verb set and a couple of
-sub-tools on the agent's behalf over HTTP — so the confined agent pays **one
-approval per session instead of one per command**.
+`flutter`/`dart` (any subcommand), a Node toolchain — `pnpm` and the project's own
+`vite`/`vitest`/`svelte-check`/`svelte-kit`/`tsc` — a guard-railed `git` verb set
+and a couple of sub-tools on the agent's behalf over HTTP, so the confined agent
+pays **one approval per session instead of one per command**.
 
 The friction it removes is specific. Inside a `workspace-write` sandbox (DSH is
 the harness this was written for) the Flutter/Dart toolchain cannot run at all —
 it fails writing the SDK lockfile — and every `git` write is denied, because the
-git directory lives outside the workspace. An agent that wants to build, test or
-commit therefore needs a fresh elevation per command. This server *is* that
-elevation, spent once; every call after it is an ordinary confined HTTP request.
+git directory lives outside the workspace. A Node toolchain dies the same way for
+a different reason: the sandbox cannot create the named pipes libuv uses for child
+stdio, so `vite` (its Windows `net use` probe, and esbuild before Vite 8),
+`vitest`'s default forks pool and `esbuild` itself all fail with `spawn EPERM`
+(`docs/vite-vitest-sandbox-findings.md`). Note that the elevation is load-bearing
+for Vite too, not just Flutter: a bridge started *confined* still fails `vite
+build`, because the probe runs inside the vite process rather than in the bridge.
+An agent that wants to build, test or commit therefore needs a fresh elevation per
+command. This server *is* that elevation, spent once; every call after it is an
+ordinary confined HTTP request.
 
-Along the way it also serializes jobs (concurrent Flutter runs fight over
-`build/`), captures UTF-8 logs regardless of the console code page, filters them
-server-side, digests `flutter test` results into counts and a failure inventory,
-keeps a job's process tree killable, and can line a local run up with what CI
-actually checks.
+Along the way it also serializes jobs per lane (concurrent Flutter runs fight over
+`build/`, and two Vite builds share `dist/`), keeps a dev server off the queue so
+it cannot starve the builds behind it, captures UTF-8 logs regardless of the
+console code page, filters them server-side, digests `flutter test` **and** vitest
+results into counts and a failure inventory, keeps a job's process killable, and
+can line a local run up with what CI actually checks.
 
 ## Read this before running it
 
@@ -30,6 +39,11 @@ whole lifetime, the access your boot approval granted.
   code with that access. What the allowlist buys is *recovery cost and surprise*
   for a fallible caller — a refused command is one you cannot lose work to — not
   privilege (ADR-0001).
+- `pnpm install` runs the project's dependency build scripts, and `pnpm run`
+  runs whatever a `package.json` says, with the same access. `pnpm exec` is
+  accepted only for the project's own script binaries, because it also runs
+  anything it finds on `PATH` (measured); `pnpm dlx` and `pnpm publish` are
+  absent by omission.
 - It binds `127.0.0.1` on an ephemeral port, and every route but `/health`
   requires a bearer token. The token is never written to a file by the bridge: it
   is printed to the job output that started it, and — when the status page opens
@@ -46,7 +60,8 @@ whole lifetime, the access your boot approval granted.
 - **Windows** — CI-verified. The code carries a POSIX fallback that nobody has
   exercised, so treat elsewhere as untested rather than supported.
 - **Python 3.11+** for the server: standard library only, no dependencies.
-- `flutter`/`dart` and `git` on `PATH` for the jobs that use them.
+- `flutter`/`dart`, `git`, and `node`/`pnpm` on `PATH` for the jobs that use
+  them. A script binary is looked for in the pinned cwd's `node_modules`.
 
 ## Install
 
@@ -95,17 +110,31 @@ $r.tail       # the last 200 log lines, UTF-8
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | liveness + `tools` + `dartFormatExe` (the formatter pin, or null); no token |
+| GET | `/health` | liveness + `tools` + `commands` (the accepted executables) + `dartFormatExe` (the formatter pin, or null); no token |
 | GET | `/?token=…` | human status page: job list + live log tail (opened at boot) |
-| POST | `/run` | `{"cmd","args","message","scope","wait","timeoutSec","grep","tail"}` → job |
+| POST | `/run` | `{"cmd","args","message","scope","long","wait","timeoutSec","grep","tail"}` → job |
 | POST | `/tools/arb-edit` | ARB localization edits plus `flutter gen-l10n`, with a structured `result` |
 | GET | `/jobs` · `/jobs/<id>?tail=N&grep=P` · `/jobs/<id>/log` | job list · one job with a log view · the raw log |
-| POST | `/jobs/<id>/kill` · `/stop` | kill that job's process tree · kill children and exit |
+| POST | `/jobs/<id>/kill` · `/stop` | kill that job's process · kill children and exit |
 
 `SKILL.md` is the full reference: request shapes, the PowerShell traps that make a
 call look like a 404, caller-timeout nesting, and what every digest field means.
 
-## Three things worth knowing
+## Four things worth knowing
+
+**Run the project's own Node tools, and keep the dev server out of the queue.**
+`{"cmd":"vite","args":["build"]}` and `{"cmd":"vitest","args":["run"]}` are
+accepted directly, and `pnpm` covers `install`/`add`/`run`/`exec`/`why`/… — a
+script binary is resolved out of the pinned cwd's `node_modules` by reading its
+package's `bin` field, so no `.cmd` wrapper drags `cmd.exe` into an argv that is
+supposed to have no shell. A command that is expected to run until it is killed
+(`vite dev`, `vite preview`, `vitest` in watch mode, a conventional
+`dev`/`start`/`serve`/`watch` script) runs on its **own lane** instead of the
+queue: `"long": true` says so explicitly, and the bridge otherwise guesses — the
+two error directions are not symmetric, since a dev server on the queue lane
+starves every build behind it until somebody kills it. `vitest` results get the
+same digest and known-failure split as `flutter test`, including the
+`Tests  no tests` shape a suite that failed to load produces.
 
 **Pin the formatter to CI's dart.** `dart format` output changes between SDK
 releases, so formatting with a newer local dart is what turns CI's
@@ -147,6 +176,9 @@ registry that cannot be read claims nothing and says so.
   guardrail rather than a privilege boundary; the working directory is pinned, so
   there is no per-job `cwd` or baseline worktree; sub-tools are queue jobs with
   structured results.
+- `docs/vite-vitest-sandbox-findings.md` — the measurements behind the Node
+  surface: which commands the sandbox kills, with what error, and why Vite 7
+  cannot be rescued the way Vite 8 can.
 - `scripts/toolhub_server.py` — the canonical program; edits here are what run.
   `scripts/arb_edit_lib.py` is the ARB edit logic behind the `arb-edit` sub-tool.
 - `scripts/sync_to_skills.py` — deploys `SKILL.md` plus `scripts/` as a skill, and
@@ -156,7 +188,7 @@ registry that cannot be read claims nothing and says so.
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python tests/test_toolhub.py        # 98 tests, standard-library unittest
+python tests/test_toolhub.py        # 144 tests, standard-library unittest
 ruff check . ; ruff format --check .
 pyright scripts tests
 ```

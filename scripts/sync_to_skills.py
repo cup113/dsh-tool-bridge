@@ -9,10 +9,15 @@ differ on purpose here: the repo is `dsh-tool-bridge`, the skill is
     python scripts/sync_to_skills.py             # deploy
     python scripts/sync_to_skills.py --dry-run   # show what would change
 
-The deployed skill carries no documentation: `README.md`, `CONTEXT.md`, `docs/`
-and `tests/` are excluded and stay in the repository. Because the destination is
-pruned of anything the project no longer has, excluding a file also removes an
-already-deployed copy of it.
+The payload is an **allow list**, not a list of exclusions: `SKILL.md` plus
+`scripts/`. That direction matters, because the failure modes are not symmetric.
+A deny list silently deploys whatever nobody thought to exclude — it had been
+shipping `.gitignore`, `LICENSE`, `ruff.toml`, `.github/` and `__pycache__/*.pyc`
+into the skill, and a scratch tree that happened to sit in the repository would
+have gone with them, at any size. An allow list can only ever ship too little,
+and a file the skill needs but does not get fails loudly the moment the server
+starts. The deployed tree is also pruned to the payload, so removing a file here
+removes its deployed copy.
 """
 
 from __future__ import annotations
@@ -25,20 +30,18 @@ import shutil
 import sys
 
 PROJECT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EXCLUDE_DIRS = {
-    ".git",
-    "__pycache__",
-    ".idea",
-    ".vscode",
-    ".ruff_cache",
-    "docs",
-    "tests",
-}
+
+# The whole payload: files at the repository root, plus everything under these
+# directories. Nothing else in the repository is deployed.
+PAYLOAD_FILES = {"SKILL.md"}
+PAYLOAD_DIRS = {"scripts"}
+
+# Compiled artefacts are never deployed, even inside the payload.
+EXCLUDE_DIRS = {"__pycache__"}
 EXCLUDE_SUFFIXES = (".pyc", ".pyo")
-# Repository-only files: the deployed skill is SKILL.md plus the server, and
-# deliberately carries no documentation. Note that excluding a file also prunes
-# an already-deployed copy of it.
-EXCLUDE_FILES = {"README.md", "CONTEXT.md"}
+
+# The destination is not a repository, and is never treated as one.
+PRUNE_SKIP_DIRS = {".git"}
 
 
 def skill_name(root: str) -> str:
@@ -55,24 +58,48 @@ def skill_name(root: str) -> str:
     return os.path.basename(root)
 
 
-def excluded(rel: str) -> bool:
-    if os.path.basename(rel) in EXCLUDE_FILES:
-        return True
-    if any(part in EXCLUDE_DIRS for part in rel.split(os.sep)):
-        return True
-    return rel.endswith(EXCLUDE_SUFFIXES)
-
-
 def project_files(root: str) -> dict[str, str]:
+    """The payload: `{relative path: absolute path}`, nothing else."""
     found: dict[str, str] = {}
-    for base, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
-        for name in files:
-            full = os.path.join(base, name)
-            rel = os.path.relpath(full, root)
-            if not excluded(rel):
-                found[rel] = full
+    for name in sorted(PAYLOAD_FILES):
+        full = os.path.join(root, name)
+        if os.path.isfile(full):
+            found[name] = full
+    for top in sorted(PAYLOAD_DIRS):
+        base_dir = os.path.join(root, top)
+        if not os.path.isdir(base_dir):
+            continue
+        for base, dirs, names in os.walk(base_dir):
+            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+            for name in names:
+                if name.endswith(EXCLUDE_SUFFIXES):
+                    continue
+                full = os.path.join(base, name)
+                found[os.path.relpath(full, root)] = full
     return found
+
+
+def prune_empty_dirs(dest: str, dry_run: bool) -> None:
+    """Removes directories that the prune emptied, deepest first.
+
+    Without this a deployment that used to carry `.github/workflows/` would keep
+    the empty directories behind, which reads as "still deployed".
+
+    The emptiness test is `os.listdir`, not the walk's own `dirs` list: that list
+    is captured before this function removes anything, so a parent whose only
+    child was just deleted still looks occupied to the walk. The filesystem is the
+    only authority on what is left.
+    """
+    for base, _dirs, _names in os.walk(dest, topdown=False):
+        if base == dest or os.path.basename(base) in PRUNE_SKIP_DIRS:
+            continue
+        try:
+            if os.listdir(base):
+                continue
+        except OSError:
+            continue
+        if not dry_run:
+            os.rmdir(base)
 
 
 def main() -> int:
@@ -98,11 +125,11 @@ def main() -> int:
             shutil.copy2(src, target)
         copied.append(rel)
 
-    # Prune anything the project no longer has. .git is never touched: the
-    # deployment is not a repository.
+    # Prune anything the payload does not contain — this is what removes a file
+    # the project has since dropped, or one a previous deny list let through.
     removed: list[str] = []
     for base, dirs, names in os.walk(dest):
-        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+        dirs[:] = [d for d in dirs if d not in PRUNE_SKIP_DIRS]
         for name in names:
             full = os.path.join(base, name)
             rel = os.path.relpath(full, dest)
@@ -111,6 +138,7 @@ def main() -> int:
             if not args.dry_run:
                 os.remove(full)
             removed.append(rel)
+    prune_empty_dirs(dest, args.dry_run)
 
     for rel in copied:
         print(f"    copied  {rel}")

@@ -1,10 +1,10 @@
 # tool-bridge
 
 A session-scoped, loopback-only server that runs the Flutter/Dart toolchain, a
-small git verb set, and sub-tools such as `arb-edit` on behalf of a confined DSH
-agent, so the agent pays one `danger-full-access` approval per session instead
-of one per command. This file fixes the vocabulary; `docs/adr/` records the
-decisions that are expensive to reverse.
+Node toolchain, a small git verb set, and sub-tools such as `arb-edit` on behalf
+of a confined DSH agent, so the agent pays one `danger-full-access` approval per
+session instead of one per command. This file fixes the vocabulary; `docs/adr/`
+records the decisions that are expensive to reverse.
 
 ## Language
 
@@ -23,7 +23,7 @@ How many times a session had to leave the bridge to get a command run; the bridg
 _Avoid_: escalation hole, privilege leak, 提权口
 
 **Allowlist**:
-The set of executables (`flutter`, `dart`, `git`) and git verbs the bridge accepts.
+The set of executables (`flutter`, `dart`, `git`, `pnpm`, and the **Script binaries**) and the git/pnpm verbs the bridge accepts.
 _Avoid_: sandbox, security boundary, whitelist, permission system
 
 **Guardrail**:
@@ -37,6 +37,14 @@ _Avoid_: workspace root (the cwd is usually the workspace, but that is a coincid
 **Format pin**:
 The dart executable fixed at boot by `--dart-format` that `dart format` **Jobs** run instead of the PATH one, so a session formats with the version a project's CI formats with — formatting with a newer local dart is what turns CI's `--set-exit-if-changed` check red.
 _Avoid_: per-request exe, SDK override, toolchain pin (too broad: `dart analyze`/`test`/`pub` deliberately keep the PATH toolchain)
+
+**Script binary**:
+One of the project's own Node tools (`vite`, `vitest`, `svelte-check`, `svelte-kit`, `tsc`) that the bridge accepts by name and resolves inside the **Pinned cwd**'s `node_modules` by reading the package's `bin` field — never through the `.cmd` wrapper, which would put `cmd.exe` in the middle of an argv that is supposed to have no shell.
+_Avoid_: local binary, npx tool, node_modules/.bin (that is the wrapper, which is exactly what is bypassed)
+
+**`pnpm` surface**:
+The named `pnpm` verbs the bridge accepts (`install`, `add`, `run`, `exec`, `why`, …), with the cwd-retargeting flags refused and `exec` narrowed to a **Script binary** — because `exec` also runs anything on `PATH`.
+_Avoid_: package manager access, npm passthrough
 
 **Uncommitted scope**:
 The `/run` field `scope: "uncommitted"`: the **Pinned cwd**'s uncommitted `.dart` files (staged, unstaged and untracked; deleted and ignored excluded), read once at submit time. `dart format` receives them as trailing paths — the **Expansion**; `analyze` and `fix` accept at most one directory, so there the same set narrows the returned log lines — the **Filter**.
@@ -61,8 +69,20 @@ _Avoid_: task, run, invocation, process (a job may outlive or precede its proces
 _Avoid_: pending, success, error, cancelled
 
 **Queue**:
-The single-worker line jobs wait in; at most one toolchain job runs at a time because concurrent Flutter runs corrupt `build/`.
+The single-worker line **Queue-lane** **Jobs** wait in; at most one toolchain job runs at a time because concurrent Flutter runs corrupt `build/` and two Vite builds share `dist/`.
 _Avoid_: pool, concurrency, workers
+
+**Lane**:
+Which of the two serialized worker lines a **Job** runs on: the **Queue** or the **Long lane**. Serialization is per lane, and `aheadOf` counts only the caller's own lane.
+_Avoid_: channel, pool, thread (a lane is a serialization domain, not a resource)
+
+**Long job**:
+A **Job** expected to run until it is killed — `vite dev`/`preview`, `vitest`'s watch mode, a conventional `dev`/`start`/`serve`/`watch` script. It runs on the **Long lane**, because on the **Queue** it would starve every build behind it until somebody killed it.
+_Avoid_: background job (nothing here is detached), daemon, server job
+
+**Long lane**:
+The second worker line, serialized among **Long jobs** only. The guess (`wants_long_lane`) covers the shapes that are certainly long; the `/run` field `long` overrides it either way, because the two error directions are not symmetric.
+_Avoid_: dev lane, watch lane, second queue
 
 **Sub-tool**:
 A named operation the bridge executes as a **Job** — `arb-edit` is the first — with the instruction as the request body and a structured `result` instead of a test **Digest**. It exists so an operation whose steps include a toolchain call is one request and no extra **Escalation**.
@@ -77,8 +97,12 @@ The structured outcome of a **Sub-tool** job: which files were edited, which key
 _Avoid_: output, report, digest (a Digest belongs to a test run)
 
 **Digest**:
-The parsed view of a finished test job: `summary`, `counts`, `failures`. Absent for non-test jobs.
+The parsed view of a finished test job: `flavor`, `summary`, `counts`, `failures`. Absent for non-test jobs.
 _Avoid_: result, report, analysis
+
+**Flavor**:
+Which test runner a **Digest** came from — `flutter` (`flutter test`/`dart test`) or `vitest`. It is what decides whether the **Known-failure registry** applies, and it comes from the reporter's own markers in the log when the argv cannot say (`pnpm run test`).
+_Avoid_: runner, kind, framework (a `Sub-tool` job has a `kind`; this is about the log)
 
 **Counts**:
 `passed`/`skipped`/`failed` read from the last `+N ~S -K:` progress line; the authoritative total.
@@ -134,7 +158,7 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 
 ## Relationships
 
-- One **Bridge** serves one session and owns one **Queue** and one **Pinned cwd**.
+- One **Bridge** serves one session and owns one **Queue**, one **Long lane** and one **Pinned cwd**.
 - A **Format pin** is boot-scoped like the **Pinned cwd**: no request can retarget either.
 - An **Uncommitted scope** is computed once, at submit time; an empty one is refused, because `dart format` with no paths rewrites the whole tree.
 - A **Known-failure registry** is read per **Job** from the **Pinned cwd**; with no registry a **Digest** is exactly what it was before the feature.
@@ -142,8 +166,11 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 - A **Sub-tool** is a **Job**: it queues, logs and is killed like any other, and its **`result`** is what a **Digest** cannot express.
 - A **Sub-tool** runs in the **Pinned cwd** like everything else; its body carries no `cwd`.
 - A **Bridge** is started by exactly one **Escalation**; every job after that costs none, so the **Escalation count** is normally 1.
-- A **Job** has one **Job status**, one log, and — for a test run — one **Digest**.
+- A **Job** has one **Job status**, one log, one **Lane**, and — for a test run — one **Digest**.
+- A **Long job** runs on the **Long lane**, so it is never counted by `aheadOf` for a **Queue** job; a **Queue** job is never blocked by it.
+- A **Script binary** is resolved in the **Pinned cwd** and runs under `node`; `pnpm exec` accepts one of those names and nothing else.
 - A **Digest** holds one **Counts** and one **Failure inventory**; the **`Failing tests:` block** may supply paths to the inventory but never its order or completeness.
+- A **Flavor** decides whether the **Known-failure registry** applies to a **Digest**; it is read from the argv when that is enough and from the log when it is not.
 - A **Tail** and an optional **Log filter** shape a response, not a job: the raw log is never rewritten.
 - The **Allowlist** is a **Guardrail**; it is not a privilege boundary, because `dart` reaches arbitrary code.
 
@@ -161,6 +188,12 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 > **Maintainer:** "With a **Format pin**: one boot flag, and `dart format` jobs run that SDK while everything else keeps the local one. The pin is boot-scoped like the **Pinned cwd**, so a session cannot quietly format with the wrong dart."
 > **Dev:** "Then `scope: uncommitted` on `dart analyze` analyzes only my files?"
 > **Maintainer:** "It cannot — the analyzer takes a directory, not a file list. That request is a **Filter**: your files' lines come back, but the exit code still describes the whole project. Only `dart format` takes an **Expansion**."
+> **Dev:** "I need `vite dev` running to look at the page while I fix a test. Add it to the queue?"
+> **Maintainer:** "Not the **Queue** — a dev server never exits, so every build behind it would wait on a process that is working exactly as intended. It is a **Long job**, on the **Long lane**, and `pnpm run dev` is guessed onto it."
+> **Dev:** "Then `pnpm exec` is the way to run anything else, since pnpm falls back to PATH?"
+> **Maintainer:** "That fallback is the problem, not the feature — measured, `pnpm exec cmd /c echo hi` works. `exec` takes a **Script binary** name and nothing else; anything else is a 403 naming `pnpm run`."
+> **Dev:** "And `pnpm run test` — does that get the known-failure split?"
+> **Maintainer:** "Yes, and that is why a **Digest** has a **Flavor** read from the log: the argv `pnpm run test` says nothing about vitest, but the reporter's own markers do."
 
 ## Flagged ambiguities
 
@@ -175,3 +208,7 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 - "scope: uncommitted for analyze" — resolved: it is a **Filter**, not an **Expansion**. `dart analyze` accepts at most one directory, so the run still covers the whole project and only the returned lines are narrowed; a pre-existing issue in an untouched file still fails the exit code.
 - "changed files" was used for the **Uncommitted scope** — resolved: they are different sets. CI compares two commits (untracked files cannot exist there); the scope reads the working tree, untracked files included.
 - "the summary says which failures are new" — resolved: it never does. The suffix counts known/new; **which** is `baseline.newFailures`, and a **Known-failure registry** that cannot be read claims nothing rather than counting everything as known.
+- "long-running job" / "background job" — resolved: a **Long job** on the **Long lane**. Nothing is detached from the bridge: it is still a **Job** with a log and a kill, and it is still serialized — just not against builds.
+- "`pnpm exec` is safe because pnpm only runs installed packages" — measured false: `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both work, because pnpm falls back to `PATH`. That is why the **`pnpm` surface** narrows `exec` to a **Script binary** and refuses `-c/--shell-mode`.
+- "the sandbox denies `vite` because of a file" — resolved: the sandbox denies **pipes**. `spawn`/`exec`/`fork` with piped stdio throw `EPERM` (no named pipes), while `inherit`, a file fd, `worker_threads` and loopback TCP all work; that single mechanism explains Vite's `net use` probe, vitest's default forks pool and esbuild's service spawn (ADR-0004).
+- "killing a job is just `taskkill`" — resolved: it is not, under this sandbox. `taskkill /F /T` answers "access denied" while the target is alive, so the fallback to the owned process handle is part of the **Long job** feature rather than a detail: without it a killed dev server kept running *and* held its lane.

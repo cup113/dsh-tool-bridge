@@ -3,12 +3,14 @@
 
 Why this exists
 ---------------
-Inside the DSH file sandbox (``workspace-write``), Flutter/Dart tooling hangs and
-git writes are denied, so every command costs a one-shot ``danger-full-access``
-escalation. This server is started **once** per session with that escalation and
-then executes the toolchain on the agent's behalf, answering over HTTP on a
-random loopback port. The agent's HTTP calls run in the confined sandbox and cost
-nothing.
+Inside the DSH file sandbox (``workspace-write``), the Flutter/Dart toolchain
+hangs, git writes are denied, and a Node toolchain dies on `spawn EPERM`: the
+sandbox cannot create the named pipes libuv uses for child stdio, so Vite's
+Windows `net use` probe, `vitest`'s default forks pool, and `esbuild` (which
+Vite 7 and earlier bundle) all fail there. This server is started **once** per
+session with a single ``danger-full-access`` escalation and then executes the
+toolchain on the agent's behalf, answering over HTTP on a random loopback port.
+The agent's HTTP calls run in the confined sandbox and cost nothing.
 
 What it is not
 --------------
@@ -16,10 +18,13 @@ It is not a shell, and it is not a privilege boundary: `dart` runs any
 subcommand, so `dart run <file>.dart` already executes arbitrary code with the
 access this process was granted. The narrow surface buys *recovery cost and
 surprise* — a refused command is one you cannot lose work to — not privilege.
-Only ``flutter``/``dart`` (any subcommand) and a small, guard-railed ``git``
-verb set are accepted, always as an argv list (never a shell string) and always
-in the working directory pinned at startup. ``git push`` is deliberately absent:
-the GitHub token must never live in a long-running process.
+Only ``flutter``/``dart`` (any subcommand), a small guard-railed ``git`` verb set,
+a named ``pnpm`` verb set, and the project's own script binaries (``vite``,
+``vitest``, ``svelte-check``, ``svelte-kit``, ``tsc``) are accepted, always as an
+argv list (never a shell string) and always in the working directory pinned at
+startup. ``git push`` is deliberately absent: the GitHub token must never live in
+a long-running process. So is `pnpm dlx`, and so is `pnpm exec` for anything but
+a script binary — measured, it runs whatever it finds on PATH.
 
 Lifecycle
 ---------
@@ -52,8 +57,8 @@ API (all but /health need ``Authorization: Bearer <token>``)
 -----------------------------------------------------------
 - ``GET  /health``                -> {"ok": true}
 - ``GET  /``                      -> human status page (token in the query string)
-- ``POST /run``                   -> {"cmd","args","message","scope","wait",
-                                     "timeoutSec","grep","tail"} -> job
+- ``POST /run``                   -> {"cmd","args","message","scope","long",
+                                     "wait","timeoutSec","grep","tail"} -> job
 - ``GET  /jobs``                  -> [job]
 - ``GET  /jobs/<id>?tail=N&grep=P`` -> job + last N log lines (or the last N
                                      lines matching the P regex)
@@ -104,6 +109,32 @@ and reports ``baseline.newFailures``: the complete, ordered list of the ones tha
 are *new*, which is the answer a caller has to act on. Without the file nothing
 changes; a registry that cannot be read says so in ``baseline.error`` rather
 than looking like "everything is new" or "everything is known".
+
+Node toolchain
+--------------
+``pnpm`` runs a named verb set (``install``, ``add``, ``run``, ``exec``,
+``why``, ...; `dlx`, `publish`, `config` and `store` are absent on purpose) with
+its cwd-retargeting flags refused, and the project's own tools run directly:
+``vite``, ``vitest``, ``svelte-check``, ``svelte-kit`` and ``tsc`` are resolved
+out of ``<cwd>/node_modules`` by reading the package's ``bin`` field, so they
+work on Windows without letting a `.cmd` wrapper pull `cmd.exe` into an argv
+that is supposed to have no shell. `pnpm exec` accepts only one of those names,
+because it also runs anything on PATH.
+
+Two runners feed the digest: `flutter test`/`dart test`, and vitest (recognised
+by its argv, or — for `pnpm run <script>`, whose script name is the project's
+own word for it — by the reporter's own markers in the log). Both get the same
+known-failure split.
+
+Long jobs
+---------
+A job that is expected to run until it is killed — `vite dev`/`preview`,
+`vitest`'s watch mode, or a conventional `dev`/`start`/`serve`/`watch` script —
+goes to its own lane instead of the queue, because a serialized queue would hold
+every build behind it until somebody killed it. `"long": true` on ``/run`` says
+so explicitly; the lane is otherwise inferred, and the two error directions are
+not symmetric (a long job on the queue starves the session; a one-shot job on the
+long lane merely occupies it until it exits).
 """
 
 from __future__ import annotations
@@ -144,7 +175,87 @@ TAIL_SCAN_BYTES = 256 * 1024
 DEFAULT_TAIL_LINES = 200
 MAX_TAIL_LINES = 5000
 
-ALLOWED_EXES = {"flutter", "dart", "git"}
+# The project's own Node tools, run straight out of `<pinned cwd>/node_modules`.
+# They are named here rather than reached through `pnpm exec` because that is
+# what the actual commands look like (`vitest run --pool=threads`), and because
+# `pnpm exec` — see below — will run anything it finds.
+SCRIPT_BINARIES = {"vite", "vitest", "svelte-check", "svelte-kit", "tsc"}
+
+# Command name -> the package that provides it, when they differ. Everything
+# else is looked up under its own name.
+SCRIPT_BINARY_PACKAGES = {"tsc": "typescript", "svelte-kit": "@sveltejs/kit"}
+
+# What the bridge accepts, by executable name. `flutter` and `dart` take any
+# subcommand; `git` and `pnpm` are verb-guarded; a script binary is resolved
+# inside the pinned cwd.
+ALLOWED_EXES = {"flutter", "dart", "git", "pnpm"} | SCRIPT_BINARIES
+
+# pnpm verbs this server will run, for a vite+svelte workflow: install a tree
+# (including the dependency build scripts a *confined* install silently skips),
+# run the project's own scripts, change dependencies and inspect the result.
+# Excluded by omission: `dlx` (fetches and runs an arbitrary package), `publish`,
+# `config`/`setup`/`self-update` (they write machine state outside the project)
+# and `store` (machine-global).
+PNPM_VERBS = {
+    "install",
+    "i",
+    "add",
+    "remove",
+    "rm",
+    "uninstall",
+    "update",
+    "up",
+    "upgrade",
+    "rebuild",
+    "dedupe",
+    "run",
+    "run-script",
+    "exec",
+    "why",
+    "list",
+    "ls",
+    "outdated",
+    "audit",
+    "licenses",
+}
+
+# Flags that retarget one of the bridge's two boot-scoped anchors — the pinned
+# cwd (ADR-0002), and "this project, not this machine". `-C`/`--dir`/`--prefix`
+# move the working directory, `-w`/`--workspace-root` moves it up to a workspace
+# root that may lie outside the pinned cwd, and `-g`/`--global` leaves the
+# project entirely. None is destructive; each just means "run somewhere this
+# session was never pointed at", which is the shape the git pathspec guard
+# refuses too.
+PNPM_BLOCKED_FLAGS = {
+    "-C",
+    "--dir",
+    "--prefix",
+    "-w",
+    "--workspace-root",
+    "-g",
+    "--global",
+}
+
+# `pnpm exec` looks in node_modules/.bin *and then on PATH*: measured,
+# `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both work. Left
+# alone it would be general command execution behind an allowlisted verb, which
+# is the one thing the allowlist exists to prevent — so its target has to be a
+# script binary, and its shell mode stays out.
+PNPM_EXEC_BLOCKED_FLAGS = {"-c", "--shell-mode"}
+
+# The long job lane. A serialized queue is the right shape for compiles and test
+# runs, and the wrong one for a process that never exits: `vite dev` would hold
+# the only worker until somebody killed it, starving every build and test behind
+# it. Jobs on this lane are serialized among themselves instead.
+LANE_QUEUE = "queue"
+LANE_LONG = "long"
+
+# Script names a project conventionally gives a server or a watcher. Detection
+# cannot be exact for `pnpm run <script>` (the name is the project's choice), and
+# the two error directions are not symmetric: a long job on the queue lane
+# starves everything until it is killed, while a one-shot job on the long lane
+# merely occupies it until it exits.
+LONG_SCRIPTS = {"dev", "start", "serve", "watch", "storybook"}
 
 # The registered sub-tools (ADR-0003). A sub-tool is a named operation executed
 # as a Job — it queues behind builds like everything else and reports a
@@ -272,6 +383,19 @@ def eprint(*parts: object) -> None:
     buffer.flush()
 
 
+def terminate_process(process: subprocess.Popen[bytes]) -> None:
+    """Terminates a process with the handle this bridge already owns.
+
+    `TerminateProcess` on an owned handle needs no new access, which is what makes
+    this both the fallback when `taskkill` is refused and the only way to stop a
+    process whose job was killed while it was still being spawned.
+    """
+    try:
+        process.kill()
+    except Exception as error:  # noqa: BLE001 - a kill must never raise
+        eprint(f"ERROR terminate failed: {error}")
+
+
 class Job:
     """One queued/running/finished command or sub-tool call."""
 
@@ -282,6 +406,7 @@ class Job:
         log_path: str,
         runner: Callable[[Job], None] | None = None,
         scope: str | None = None,
+        long: bool = False,
     ) -> None:
         self.id = uuid.uuid4().hex[:12]
         # For a sub-tool job this is the display argv the status page shows;
@@ -295,6 +420,10 @@ class Job:
         # The scope the request asked for, kept for observability: `argv` shows
         # the expansion, this says where those paths came from.
         self.scope = scope
+        # Which lane the job runs on. A long job is one expected to run until it
+        # is killed; it is serialized against other long jobs instead of against
+        # the queue, so a dev server cannot starve every build behind it.
+        self.long = long
         self.status = "queued"  # queued|running|done|failed|killed
         self.exit_code: int | None = None
         self.resolved: list[str] | None = None
@@ -316,6 +445,22 @@ class Job:
         """`tool` for a sub-tool job, `cmd` for an argv job."""
         return "tool" if self.runner is not None else "cmd"
 
+    def begin_running(self) -> bool:
+        """Claims the job for its worker, or refuses if it was already killed.
+
+        One critical section, shared with :meth:`kill`, because the two decisions
+        must not interleave: a plain `status = "running"` overwrote a kill that
+        landed just before it, and the process then ran while the status said it
+        was alive — so nothing ever terminated it. For a dev server that is a
+        process nobody can address *and* a lane that never moves again.
+        """
+        with self._lock:
+            if self.status == "killed":
+                return False
+            self.status = "running"
+            self.started_at = time.time()
+            return True
+
     def set_process(self, process: subprocess.Popen[bytes]) -> None:
         with self._lock:
             self._process = process
@@ -330,6 +475,15 @@ class Job:
         The status is set to `killed` *before* taskkill runs: the worker's
         `process.wait()` returns as soon as the process dies and would otherwise
         classify the job from the kill's own exit code.
+
+        On Windows `taskkill /T` is the only thing that reaches the *tree*, but it
+        is a fresh process asking for access it can be refused — under the DSH
+        sandbox it fails with "access denied" while the target is alive and well.
+        A refused tree kill must not leave a dev server running with nobody
+        tracking it, so the handle this process already owns terminates the
+        process directly. Children (esbuild's service, a forked test runner) are
+        not reached that way; they exit with their parent's collapsed stdio, and
+        the job's status is what the caller sees either way.
         """
         with self._lock:
             if self.status not in ("queued", "running"):
@@ -340,12 +494,18 @@ class Job:
             return False
         try:
             if IS_WINDOWS:
-                subprocess.run(  # noqa: S603 - argv list, no shell
+                completed = subprocess.run(  # noqa: S603 - argv list, no shell
                     ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                     capture_output=True,
                     creationflags=CREATE_NO_WINDOW,
                     check=False,
                 )
+                if completed.returncode != 0:
+                    eprint(
+                        f"TOOLHUB KILL taskkill refused rc={completed.returncode} "
+                        f"job={self.id}; terminating the process directly"
+                    )
+                    terminate_process(process)
             else:
                 process.kill()
         except Exception as error:  # noqa: BLE001 - kill must never raise
@@ -364,6 +524,7 @@ class Job:
             "resolvedArgv": self.resolved,
             "status": self.status,
             "scope": self.scope,
+            "long": self.long,
             "exitCode": self.exit_code,
             "startedAt": self.started_at,
             "finishedAt": self.finished_at,
@@ -543,11 +704,23 @@ class TestCounts(TypedDict):
 
 
 class TestLogDigest(TypedDict):
-    """The result of `analyze_test_log`."""
+    """The result of `analyze_test_log`.
 
+    ``flavor`` names the runner the digest came from (``flutter`` for
+    `flutter test`/`dart test`, ``vitest`` for a vitest run) and is None for
+    everything else — it is what decides whether the known-failure registry
+    applies, since a *passing* run also has a digest.
+    """
+
+    flavor: str | None
     summary: str | None
     counts: TestCounts | None
     failures: list[TestFailure]
+
+
+def empty_digest() -> TestLogDigest:
+    """No digest: not a test run, or a runner this bridge does not read."""
+    return {"flavor": None, "summary": None, "counts": None, "failures": []}
 
 
 def is_test_run(argv: list[str]) -> bool:
@@ -555,6 +728,29 @@ def is_test_run(argv: list[str]) -> bool:
     if len(argv) < 2:
         return False
     return command_name(argv[0]) in ("flutter", "dart") and argv[1] == "test"
+
+
+def is_vitest_run(argv: list[str]) -> bool:
+    """Whether argv certainly runs vitest — the binary, or `pnpm exec vitest`.
+
+    `pnpm run test` also runs vitest and cannot be told from the argv, which is
+    what `might_run_vitest` plus the log sniff are for.
+    """
+    name = command_name(argv[0]) if argv else ""
+    if name == "vitest":
+        return True
+    if name == "pnpm" and len(argv) > 2 and argv[1] == "exec":
+        return command_name(argv[2]) == "vitest"
+    return False
+
+
+def might_run_vitest(argv: list[str]) -> bool:
+    """Whether argv *could* be a vitest run without naming it.
+
+    Only a gate for the content sniff, so a `git log` or `dart analyze` job
+    never opens its log looking for a reporter it cannot have.
+    """
+    return bool(argv) and command_name(argv[0]) in ("pnpm", "vitest")
 
 
 def split_path_and_name(text: str) -> tuple[str | None, str]:
@@ -624,8 +820,8 @@ def summarize_test_run(counts: TestCounts | None, terminal: bool) -> str:
     return f"{passed} passed" + (f", {skipped} skipped" if skipped else "")
 
 
-def analyze_test_log(argv: list[str], log_path: str) -> TestLogDigest:
-    """Digest for `flutter test` / `dart test`, else an empty result.
+def parse_flutter_log(log_path: str) -> TestLogDigest:
+    """Digest for a `flutter test` / `dart test` log.
 
     The authoritative count comes from the last `+passed ~skipped -failed:`
     progress line. The failure inventory comes from the `[E]` progress lines
@@ -636,13 +832,11 @@ def analyze_test_log(argv: list[str], log_path: str) -> TestLogDigest:
     suite path to an entry that has none.
 
     Returns {"summary", "counts", "failures"} where summary is the one-line
-    digest (None when this was not a test run), counts is
-    {"passed","skipped","failed"} from the last progress line, and failures is
-    [{"file","name","didNotComplete"}] in run order.
+    digest, counts is {"passed","skipped","failed"} from the last progress line,
+    and failures is [{"file","name","didNotComplete"}] in run order.
     """
-    result: TestLogDigest = {"summary": None, "counts": None, "failures": []}
-    if not is_test_run(argv):
-        return result
+    result = empty_digest()
+    result["flavor"] = "flutter"
     failures: list[TestFailure] = []
     block: list[TestFailure] = []
     counts: TestCounts | None = None
@@ -694,6 +888,172 @@ def analyze_test_log(argv: list[str], log_path: str) -> TestLogDigest:
     result["counts"] = counts
     result["summary"] = summarize_test_run(counts, terminal)
     return result
+
+
+# --- vitest -----------------------------------------------------------------
+# vitest 5's default reporter, as a job log gets it (no TTY, so no colour). The
+# end-of-run summary is both the authoritative count and the only proof the run
+# finished — there is no flutter-style "Some tests failed." marker:
+#
+#        Test Files  1 failed | 1 passed (2)
+#             Tests  1 failed | 3 passed (4)
+#
+# A run killed mid-suite prints neither, which is why `counts is None` stays
+# "see log". Anchoring on `Tests`/`Test Files` **followed by two spaces** is also
+# what keeps jest's `Tests: 1 failed, 2 passed, 3 total` out.
+VITEST_TESTS_LINE_RE = re.compile(r"^ *Tests {2,}(?P<body>\S.*)$")
+VITEST_FILES_LINE_RE = re.compile(r"^ *Test Files {2,}(?P<body>\S.*)$")
+# "1 failed | 3 passed | 1 skipped (4)".
+VITEST_COUNT_RE = re.compile(r"(\d+) (failed|passed|skipped|todo)")
+VITEST_TOTAL_RE = re.compile(r"\((\d+)\)\s*$")
+# The separator bar is U+23AF repeated, and the `⎯⎯ Failed Tests 1 [1/1]⎯` form
+# carries a counter before its closing bar, so only the head is matched.
+VITEST_SECTION_RE = re.compile(
+    r"^[^\w\s]{2,} (?P<name>Failed Tests|Failed Suites|Unhandled Errors) (?P<count>\d+) "
+)
+VITEST_FAIL_RE = re.compile(r"^ *FAIL {2,}(?P<rest>\S.*)$")
+VITEST_NO_TESTS = "no tests"
+# A suite that never loaded is reported the way the flutter digest reports a
+# compile failure — a failure whose name starts with "loading " — so one
+# registry rule can claim it on either runner.
+VITEST_LOAD_PREFIX = "loading "
+
+
+def looks_like_vitest(log_path: str) -> bool:
+    """Whether a log carries the vitest reporter's own markers.
+
+    Needed because `pnpm run test` says nothing about vitest in its argv, and the
+    known-failure split has to apply to exactly the runs that have a digest.
+    """
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.rstrip("\n")
+                if (
+                    VITEST_TESTS_LINE_RE.match(line)
+                    or VITEST_FILES_LINE_RE.match(line)
+                    or VITEST_SECTION_RE.match(line)
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def split_vitest_failure(rest: str) -> tuple[str | None, str]:
+    """`src/App.test.ts > add > fails on purpose` -> (path, `add > fails ...`).
+
+    The default reporter names a failure as `<path> > <suite> > <name>`, so the
+    suite path is what precedes the *first* separator and the rest is the test's
+    full name — which is what a known-failure entry matches on.
+    """
+    head, sep, tail = rest.partition(" > ")
+    if sep and tail:
+        return head.strip(), tail.strip()
+    return None, rest
+
+
+def parse_vitest_counts(body: str) -> TestCounts:
+    """The body of a `Tests  ...` summary line as counts.
+
+    `skipped` is preferred from the trailing total rather than from the
+    `skipped` token alone, so a `todo` test lands in the same "not run" bucket
+    instead of disappearing from the numbers.
+    """
+    if VITEST_NO_TESTS in body:
+        return {"passed": 0, "skipped": 0, "failed": 0}
+    counts: TestCounts = {"passed": 0, "skipped": 0, "failed": 0}
+    for number, kind in VITEST_COUNT_RE.findall(body):
+        if kind == "failed":
+            counts["failed"] += int(number)
+        elif kind == "passed":
+            counts["passed"] += int(number)
+        else:
+            counts["skipped"] += int(number)
+    total = VITEST_TOTAL_RE.search(body)
+    if total is not None:
+        unaccounted = int(total.group(1)) - counts["passed"] - counts["failed"]
+        if unaccounted >= 0:
+            counts["skipped"] = unaccounted
+    return counts
+
+
+def parse_vitest_log(log_path: str) -> TestLogDigest:
+    """Digest for a vitest run.
+
+    Counts come from the `Tests` summary line, with the failing **suites** of the
+    `Failed Suites` section folded into `failed`: a file that cannot be imported
+    runs no tests at all, so its summary line reads `Tests  no tests` while the
+    run is red — a digest reporting "0 passed" there would be worse than none.
+    The inventory is the `FAIL` lines, complete and in run order; unlike
+    `flutter test`'s `Failing tests:` block, the reporter caps nothing.
+    """
+    result = empty_digest()
+    result["flavor"] = "vitest"
+    failures: list[TestFailure] = []
+    counts: TestCounts | None = None
+    suites_failed = 0
+    in_suites = False
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+            for raw in handle:
+                line = raw.rstrip("\n")
+                section = VITEST_SECTION_RE.match(line)
+                if section:
+                    # Which section a FAIL line sits in is what separates "this
+                    # suite did not load" from "this test failed".
+                    in_suites = section.group("name") == "Failed Suites"
+                    if in_suites:
+                        suites_failed = int(section.group("count"))
+                    continue
+                fail = VITEST_FAIL_RE.match(line)
+                if fail:
+                    rest = fail.group("rest").strip()
+                    if in_suites:
+                        # `FAIL  src/broken.test.ts [ src/broken.test.ts ]`
+                        file = rest.split(" [ ", 1)[0].strip()
+                        failures.append(
+                            {
+                                "file": file,
+                                "name": VITEST_LOAD_PREFIX + file,
+                                "didNotComplete": False,
+                            }
+                        )
+                    else:
+                        file, name = split_vitest_failure(rest)
+                        failures.append(
+                            {"file": file, "name": name, "didNotComplete": False}
+                        )
+                    continue
+                tests = VITEST_TESTS_LINE_RE.match(line)
+                if tests:
+                    counts = parse_vitest_counts(tests.group("body"))
+    except OSError:
+        return result
+
+    if counts is not None and suites_failed:
+        counts["failed"] += suites_failed
+    result["failures"] = failures
+    result["counts"] = counts
+    # The summary line is the run's last output, so seeing it *is* reaching the
+    # end: a killed vitest run never writes one.
+    result["summary"] = summarize_test_run(counts, counts is not None)
+    return result
+
+
+def analyze_test_log(argv: list[str], log_path: str) -> TestLogDigest:
+    """The digest for a job, whichever runner produced its log.
+
+    Two runners are read — `flutter test`/`dart test`, and vitest. What a command
+    *is* decides the parser, except for `pnpm run <script>`: the script name is
+    the project's own word for what it runs, so there the log content is the
+    only evidence. Anything else has no digest at all.
+    """
+    if is_test_run(argv):
+        return parse_flutter_log(log_path)
+    if is_vitest_run(argv) or (might_run_vitest(argv) and looks_like_vitest(log_path)):
+        return parse_vitest_log(log_path)
+    return empty_digest()
 
 
 # ---------------------------------------------------------------------------
@@ -1171,12 +1531,23 @@ class ToolHub:
         self._uncommitted_files = uncommitted_files_fn or uncommitted_dart_files
         self.jobs: dict[str, Job] = {}
         self.order: list[str] = []
-        self._queue: queue.Queue[Job] = queue.Queue()
+        # One worker per lane, one job at a time within a lane. Compiles and test
+        # runs must not overlap (they fight over `build/`, `dist/` and the
+        # package manager's store), while a long job — a dev server — must not
+        # hold the queue while it waits to be killed.
+        self._queues: dict[str, queue.Queue[Job]] = {
+            LANE_QUEUE: queue.Queue(),
+            LANE_LONG: queue.Queue(),
+        }
         self._lock = threading.Lock()
-        self._current: Job | None = None
+        self._current: dict[str, Job | None] = {LANE_QUEUE: None, LANE_LONG: None}
         self._stopping = threading.Event()
-        self._worker = threading.Thread(target=self._work, daemon=True)
-        self._worker.start()
+        self._workers = [
+            threading.Thread(target=self._work, args=(lane,), daemon=True)
+            for lane in (LANE_QUEUE, LANE_LONG)
+        ]
+        for worker in self._workers:
+            worker.start()
 
     # ---- submission ----
 
@@ -1186,15 +1557,20 @@ class ToolHub:
         args: list[str],
         message: str | None = None,
         scope: str | None = None,
+        long: bool | None = None,
     ) -> Job:
+        """Queues a command. `long` defaults to what the command looks like."""
         argv = build_argv(cmd, args, message)
         validate(argv)
+        if long is None:
+            long = wants_long_lane(cmd, list(args))
         return self._enqueue(
             Job(
                 argv,
                 self.cwd,
                 os.path.join(self.log_dir, "pending.log"),
                 scope=scope,
+                long=long,
             )
         )
 
@@ -1226,14 +1602,14 @@ class ToolHub:
         )
 
     def _enqueue(self, job: Job) -> Job:
-        """Registers a job, creates its log and hands it to the worker."""
+        """Registers a job, creates its log and hands it to its lane's worker."""
         with self._lock:
             job.log_path = os.path.join(self.log_dir, f"{job.id}.log")
             # index order: newest last
             self.jobs[job.id] = job
             self.order.append(job.id)
         open(job.log_path, "wb").close()
-        self._queue.put(job)
+        self._queues[LANE_LONG if job.long else LANE_QUEUE].put(job)
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -1245,41 +1621,52 @@ class ToolHub:
             return [self.jobs[job_id] for job_id in self.order]
 
     def current(self) -> Job | None:
-        return self._current
+        """The job running on the queue lane, if any (the long lane has its own)."""
+        return self._current[LANE_QUEUE]
 
     def ahead_of(self, job_id: str) -> int:
-        """How many unfinished jobs sit ahead of this one.
+        """How many unfinished jobs sit ahead of this one **on its own lane**.
 
-        Counts the running job too, not just queued ones: jobs are serialized,
-        so "the thing blocking me" is usually the one already running, and
-        reporting 0 there reads as "nothing in the way".
+        Counts the running job too, not just queued ones: jobs are serialized, so
+        "the thing blocking me" is usually the one already running, and reporting
+        0 there reads as "nothing in the way". Jobs on the other lane are not in
+        the way at all, so a build sitting behind a dev server would be a lie.
         """
+        job = self.get(job_id)
+        if job is None:
+            return 0
         with self._lock:
             ordered = [self.jobs[entry] for entry in self.order]
         pending = 0
         for candidate in ordered:
             if candidate.id == job_id:
                 break
-            if candidate.status in ("queued", "running"):
+            if candidate.long == job.long and candidate.status in ("queued", "running"):
                 pending += 1
         return pending
 
     # ---- execution ----
 
-    def _work(self) -> None:
+    def _work(self, lane: str) -> None:
+        work = self._queues[lane]
         while not self._stopping.is_set():
             try:
-                job = self._queue.get(timeout=0.2)
+                job = work.get(timeout=0.2)
             except queue.Empty:
                 continue
             if self._stopping.is_set():
                 return
-            self._run(job)
+            self._run(job, lane)
 
-    def _run(self, job: Job) -> None:
-        self._current = job
-        job.status = "running"
-        job.started_at = time.time()
+    def _run(self, job: Job, lane: str) -> None:
+        if not job.begin_running():
+            # Killed while it was still queued: there was no process to kill, so
+            # the status is the only record of the caller's decision. Running it
+            # now would contradict the answer `POST /jobs/<id>/kill` already gave
+            # — and for a dev server that means a process nobody is tracking.
+            job.started_at = job.finished_at = time.time()
+            return
+        self._current[lane] = job
         try:
             if job.runner is None:
                 self._run_command(job)
@@ -1294,12 +1681,14 @@ class ToolHub:
             job.error = str(error)
         finally:
             job.finished_at = time.time()
-            self._current = None
+            self._current[lane] = None
 
     def _run_command(self, job: Job) -> None:
         env = make_job_env()
         try:
-            launch, extra_env = resolve_launch(job.argv, self.dart_format_exe)
+            launch, extra_env = resolve_launch(
+                job.argv, self.dart_format_exe, cwd=job.cwd
+            )
         except FileNotFoundError as error:
             job.status = "failed"
             job.exit_code = 127
@@ -1310,8 +1699,9 @@ class ToolHub:
         job.resolved = launch
         env.update(extra_env)
         try:
-            # One job at a time on purpose: concurrent flutter invocations fight
-            # over build/ (we have seen a locked sqlite3.dll break a run).
+            # One job at a time per lane on purpose: concurrent flutter
+            # invocations fight over build/ (we have seen a locked sqlite3.dll
+            # break a run), and two vite builds share `dist/` and `node_modules`.
             with open(job.log_path, "wb") as sink:
                 process = subprocess.Popen(  # noqa: S603 - argv list, no shell
                     launch,
@@ -1323,22 +1713,35 @@ class ToolHub:
                     creationflags=CREATE_NO_WINDOW,
                 )
                 job.set_process(process)
+                if job.status == "killed":
+                    # `kill()` ran in the window between "running" and this line,
+                    # when there was no handle for it to reach: the caller was
+                    # told the job is killed, so the process it just spawned must
+                    # not outlive that answer — a dev server nobody can address
+                    # would also hold this lane forever.
+                    terminate_process(process)
                 exit_code = process.wait()
             job.exit_code = exit_code
-            if job.status != "killed":
-                job.status = "done" if exit_code == 0 else "failed"
+            # The digest is computed *before* the terminal status is published: a
+            # caller that waits on `status` is entitled to find `summary`,
+            # `counts`, `failures` and `baseline` already attached, and the other
+            # order let `wait:true` return a job that was `done` with a null
+            # summary — a race a client cannot distinguish from a broken parser.
             digest = analyze_test_log(job.argv, job.log_path)
             job.summary = digest["summary"]
             job.counts = digest["counts"]
             job.failures = digest["failures"]
-            if is_test_run(job.argv):
+            if digest["flavor"] is not None:
                 # Read now, from the pinned cwd: the registry describes the
                 # project as it is at run time, and its absence is simply
-                # "nothing changes".
+                # "nothing changes". Gated on the digest's flavor, not on the
+                # runner's name, so `pnpm run test` gets the same split.
                 registry = load_known_failures(job.cwd)
                 report = baseline_report(job.failures, digest["counts"], registry)
                 job.baseline = report
                 job.summary = summarize_with_baseline(job.summary, report)
+            if job.status != "killed":
+                job.status = "done" if exit_code == 0 else "failed"
         except FileNotFoundError:
             job.status = "failed"
             job.exit_code = 127
@@ -1350,9 +1753,9 @@ class ToolHub:
 
     def stop(self) -> None:
         self._stopping.set()
-        current = self._current
-        if current is not None:
-            current.kill()
+        for current in self._current.values():
+            if current is not None:
+                current.kill()
         for job in self.list_jobs():
             if job.status in ("queued", "running"):
                 job.kill()
@@ -1376,8 +1779,49 @@ def dart_format_target(argv: list[str], pin: str | None) -> str | None:
     return pin
 
 
+def wants_long_lane(cmd: str, args: list[str]) -> bool:
+    """Whether a command is expected to run until someone kills it.
+
+    Peeling `pnpm exec`/`pnpm run` first, the shapes that are certainly long are
+    vite's dev server and vitest's watch mode; a `pnpm run <script>` cannot be
+    known (the name is the project's), so the conventional server/watcher names
+    in ``LONG_SCRIPTS`` count too. Both error directions argue for guessing:
+    a long job left on the queue lane starves every build behind it until it is
+    killed, while a one-shot job put on the long lane merely occupies that lane
+    until it exits. `--help`/`--version` are excluded so a probe never lands
+    there at all.
+    """
+    parts = list(args)
+    exe = command_name(cmd)
+    if exe == "pnpm":
+        verb = parts[0] if parts else ""
+        rest = parts[1:]
+        if verb == "exec":
+            parts = rest
+            if not parts:
+                return False
+            exe, parts = command_name(parts[0]), parts[1:]
+        elif verb in ("run", "run-script"):
+            script = next((token for token in rest if not token.startswith("-")), None)
+            return script in LONG_SCRIPTS
+        else:
+            return False
+    if any(token in ("--help", "-h", "--version", "-v") for token in parts):
+        return False
+    positional = [token for token in parts if not token.startswith("-")]
+    if exe == "vite":
+        # Bare `vite` is the dev server; `preview` serves until it is stopped.
+        return not positional or positional[0] in ("dev", "serve", "preview")
+    if exe == "vitest":
+        # `vitest` alone watches; `run`/`--run` is the one-shot form.
+        return "run" not in positional and "--run" not in parts
+    return False
+
+
 def resolve_launch(
-    argv: list[str], dart_format_exe: str | None = None
+    argv: list[str],
+    dart_format_exe: str | None = None,
+    cwd: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """Turns an allowlisted command into a real executable invocation.
 
@@ -1385,7 +1829,9 @@ def resolve_launch(
     cannot execute and which would drag `cmd.exe` — and its parsing rules — into
     the middle of an argv that is supposed to have no shell. Both wrappers only
     launch the SDK's own `dart.exe` (with the flutter_tools snapshot for
-    `flutter`), so that is what we call directly.
+    `flutter`), so that is what we call directly. `pnpm` is the same problem with
+    a different shape (see ``resolve_pnpm``), and a project-local script binary
+    is reached the same way (see ``resolve_script_binary``).
 
     ``dart_format_exe`` is the boot-time **format pin**: when it is set, a `dart
     format` job launches *that* executable instead. It is an explicit path to a
@@ -1393,6 +1839,11 @@ def resolve_launch(
     `.bat` dance nor `FLUTTER_ROOT` — and it is checked here rather than trusted,
     because a pin that has gone missing must fail the job loudly rather than fall
     back to the formatter the pin exists to avoid.
+
+    ``cwd`` is the pinned working directory, and only a script binary needs it:
+    that is where its package is installed. It is a defaulted argument rather
+    than a required one because `flutter`/`dart`/`git`/`pnpm` resolve globally;
+    every job passes ``job.cwd``.
 
     Returns the argv to launch plus environment additions. Raises
     FileNotFoundError.
@@ -1402,6 +1853,12 @@ def resolve_launch(
         if not os.path.isfile(pin):
             raise FileNotFoundError(f"pinned dart format executable is missing: {pin}")
         return ([pin, *argv[1:]], {})
+    name = command_name(argv[0])
+    if name in SCRIPT_BINARIES:
+        target = resolve_script_binary(cwd or os.getcwd(), name)
+        return ([node_exe(), target, *argv[1:]], {})
+    if name == "pnpm":
+        return ([*resolve_pnpm(), *argv[1:]], {})
     exe = shutil.which(argv[0])
     if exe is None:
         raise FileNotFoundError(f"executable not found on PATH: {argv[0]}")
@@ -1428,6 +1885,110 @@ def resolve_launch(
     return ([exe, *argv[1:]], {})
 
 
+def node_exe() -> str:
+    """The Node interpreter a script binary runs under."""
+    exe = shutil.which("node")
+    if exe is None:
+        raise FileNotFoundError(
+            "node is not on PATH — the bridge needs it to run a project's own "
+            "vite/vitest/svelte-check/tsc"
+        )
+    return exe
+
+
+def resolve_script_binary(cwd: str, name: str) -> str:
+    """The JavaScript entry point of a project-local script binary.
+
+    Not `node_modules/.bin/<name>.CMD`: that is a shell wrapper, which
+    CreateProcess cannot execute — running it would drag `cmd.exe` into the
+    middle of an argv that is supposed to have no shell, the same reason
+    `flutter.bat` is unpacked. The wrapper's body names exactly this target
+    (`node "%~dp0\\..\\vite\\bin\\vite.js"`), so the package's own `bin` field is
+    read instead, which also follows pnpm's `node_modules/<pkg>` symlink into the
+    virtual store.
+
+    Raises FileNotFoundError when the package is not installed in the pinned cwd,
+    or when its `bin` field points outside the package.
+    """
+    package = SCRIPT_BINARY_PACKAGES.get(name, name)
+    package_dir = os.path.join(cwd, "node_modules", *package.split("/"))
+    manifest = os.path.join(package_dir, "package.json")
+    if not os.path.isfile(manifest):
+        raise FileNotFoundError(
+            f"{name} is not installed in {cwd}: {manifest} is missing "
+            "(install the project's dependencies first)"
+        )
+    try:
+        with open(manifest, "r", encoding="utf-8", errors="replace") as handle:
+            document = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise FileNotFoundError(f"cannot read {manifest}: {error}") from error
+    entry = document.get("bin")
+    if isinstance(entry, dict):
+        entry = entry.get(name)
+    if not isinstance(entry, str) or not entry:
+        raise FileNotFoundError(f"{package} declares no `bin` entry for {name!r}")
+    root = os.path.realpath(package_dir)
+    target = os.path.realpath(os.path.join(package_dir, entry))
+    if target != root and not target.startswith(root + os.sep):
+        raise FileNotFoundError(f"{name} points outside its package: {entry!r}")
+    if not os.path.isfile(target):
+        raise FileNotFoundError(f"{name} entry point is missing: {target}")
+    return target
+
+
+def resolve_pnpm() -> list[str]:
+    """How to launch pnpm as a real executable.
+
+    On Windows `pnpm` on PATH is `pnpm.CMD` (or `.ps1`), which CreateProcess
+    cannot execute. A standalone pnpm ships `pnpm.exe` and is used as it is;
+    otherwise the wrapper's JavaScript entry is located — first by the layout
+    every npm/pnpm install uses, then by reading the wrapper itself, because a
+    corepack-managed install names its own path. Raises FileNotFoundError.
+    """
+    exe = shutil.which("pnpm")
+    if exe is None:
+        raise FileNotFoundError(
+            "pnpm is not on PATH — install it, or run the project's scripts with "
+            "its package manager"
+        )
+    if exe.lower().endswith(".exe"):
+        return [exe]
+    base = os.path.dirname(exe)
+    for parts in (
+        ("node_modules", "pnpm", "bin", "pnpm.mjs"),
+        ("node_modules", "pnpm", "bin", "pnpm.cjs"),
+    ):
+        candidate = os.path.join(base, *parts)
+        if os.path.isfile(candidate):
+            return [node_exe(), candidate]
+    entry = node_entry_from_shim(exe)
+    if entry is not None:
+        return [node_exe(), entry]
+    raise FileNotFoundError(
+        f"cannot find pnpm's JavaScript entry point behind the wrapper {exe}"
+    )
+
+
+def node_entry_from_shim(shim: str) -> str | None:
+    """The JS entry a `.cmd` wrapper launches, read out of the wrapper itself.
+
+    The last `node_modules\\...\\x.{mjs,cjs,js}` path in the file is the one it
+    runs: npm- and corepack-generated wrappers put their single `node "<entry>"`
+    call at the end.
+    """
+    try:
+        with open(shim, "r", encoding="utf-8", errors="replace") as handle:
+            text = handle.read()
+    except OSError:
+        return None
+    matches = re.findall(r"node_modules[\\/][^\"'\s]+\.(?:mjs|cjs|js)", text)
+    if not matches:
+        return None
+    candidate = os.path.join(os.path.dirname(shim), *matches[-1].split("\\"))
+    return candidate if os.path.isfile(candidate) else None
+
+
 def command_name(cmd: str) -> str:
     """The bare tool name behind a path or a Windows wrapper suffix."""
     exe = os.path.basename(cmd).lower()
@@ -1443,9 +2004,14 @@ def validate(argv: list[str]) -> None:
         raise ValueError(
             f"command not allowed: {argv[0]!r} (allowed: {sorted(ALLOWED_EXES)})"
         )
-    if exe != "git":
-        return
-    args = argv[1:]
+    if exe == "git":
+        validate_git(argv[1:])
+    elif exe == "pnpm":
+        validate_pnpm(argv[1:])
+
+
+def validate_git(args: list[str]) -> None:
+    """The `git` surface: named verbs, per-verb flag guards, a message rule."""
     if not args:
         raise ValueError("git needs a verb")
     verb = args[0]
@@ -1468,6 +2034,106 @@ def validate(argv: list[str]) -> None:
         raise ValueError(
             "git commit needs a message: pass the inline 'message' field to "
             "/run, or one of -m/--message/-F/--file/-C/--reuse-message"
+        )
+
+
+def blocked_flag(token: str, blocked: set[str]) -> str | None:
+    """The blocked flag a token sets, if any.
+
+    Handles the three shapes a flag travels in: `--dir x`, `--dir=x` and a short
+    one attached to its value (`-Cx`), which is why a short blocked flag is
+    matched as a prefix rather than by equality.
+    """
+    head = token.split("=", 1)[0]
+    if head in blocked:
+        return head
+    for short in blocked:
+        if (
+            short.startswith("-")
+            and not short.startswith("--")
+            and token.startswith(short)
+            and len(token) > len(short)
+        ):
+            return short
+    return None
+
+
+def pnpm_refusal(flag: str) -> str:
+    """Why a pnpm flag is refused, and what to do instead."""
+    return (
+        f"pnpm flag not allowed: {flag!r} — it would run outside the pinned "
+        "working directory (or outside the project); the bridge pins one cwd "
+        "per session and no request can retarget it"
+    )
+
+
+def validate_pnpm(args: list[str]) -> None:
+    """The `pnpm` surface: named verbs, no retargeting, `exec` guarded.
+
+    The verb list is an allow list (unlike `flutter`/`dart`, which take any
+    subcommand) because the interesting question for a package manager is what
+    it is allowed to touch, and the answer differs per verb.
+    """
+    if not args:
+        raise ValueError("pnpm needs a verb")
+    verb = args[0]
+    hit = blocked_flag(verb, PNPM_BLOCKED_FLAGS)
+    if hit is not None:
+        raise ValueError(pnpm_refusal(hit))
+    if verb.startswith("-"):
+        raise ValueError(f"pnpm needs a verb before flags: {verb!r}")
+    if verb not in PNPM_VERBS:
+        raise ValueError(
+            f"pnpm verb not allowed: {verb!r} (allowed: {sorted(PNPM_VERBS)})"
+        )
+    if verb == "exec":
+        validate_pnpm_exec(args[1:])
+        return
+    guard_pnpm_flags(args[1:], set())
+
+
+def guard_pnpm_flags(args: list[str], extra: set[str]) -> None:
+    """Refuses retargeting flags, up to the `--` that ends pnpm's own surface."""
+    for token in args:
+        if token == "--":
+            return
+        if not token.startswith("-"):
+            continue
+        hit = blocked_flag(token, PNPM_BLOCKED_FLAGS | extra)
+        if hit is not None:
+            raise ValueError(pnpm_refusal(hit))
+
+
+def validate_pnpm_exec(args: list[str]) -> None:
+    """`pnpm exec` may run one of the project's script binaries, and nothing else.
+
+    Measured: `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both
+    work, because pnpm falls back to PATH. Allowed as-is that would hand out
+    general command execution behind an allowlisted verb — the one thing this
+    list exists to prevent (ADR-0001) — so the target has to be a bare script
+    binary name. Anything else is a 403 naming `pnpm run`.
+    """
+    target: str | None = None
+    for token in args:
+        if token == "--":
+            continue
+        if token.startswith("-"):
+            hit = blocked_flag(token, PNPM_BLOCKED_FLAGS | PNPM_EXEC_BLOCKED_FLAGS)
+            if hit is not None:
+                raise ValueError(pnpm_refusal(hit))
+            continue
+        target = token
+        break
+    if target is None:
+        raise ValueError(
+            "pnpm exec needs a script binary to run, e.g. pnpm exec vitest run"
+        )
+    if target not in SCRIPT_BINARIES:
+        raise ValueError(
+            f"pnpm exec target not allowed: {target!r} "
+            f"(allowed: {sorted(SCRIPT_BINARIES)}) — pnpm exec runs anything it "
+            "finds, including things on PATH, so only the project's own tools are "
+            "accepted; run a package script with 'pnpm run <script>' instead"
         )
 
 
@@ -1717,7 +2383,7 @@ def path_filter_regex(paths: list[str]) -> re.Pattern[str]:
 
 def make_handler(hub: ToolHub, token: str, status_url: str):
     class Handler(BaseHTTPRequestHandler):
-        server_version = "toolhub/1.1"
+        server_version = "toolhub/1.2"
         protocol_version = "HTTP/1.1"
 
         # ---- plumbing ----
@@ -1836,6 +2502,7 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                     {
                         "ok": True,
                         "tools": list(TOOL_NAMES),
+                        "commands": sorted(ALLOWED_EXES),
                         "dartFormatExe": hub.dart_format_exe,
                     },
                 )
@@ -1922,6 +2589,10 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                 if scope is not None and not isinstance(scope, str):
                     self._error(400, "scope must be a string")
                     return
+                long_running = body.get("long")
+                if long_running is not None and not isinstance(long_running, bool):
+                    self._error(400, "long must be a boolean")
+                    return
                 try:
                     tail, grep = parse_log_query(body.get("grep"), body.get("tail"))
                 except ValueError as error:
@@ -1965,7 +2636,13 @@ def make_handler(hub: ToolHub, token: str, status_url: str):
                     else:
                         grep = path_filter_regex(files)
                 try:
-                    job = hub.submit(cmd, list(args), message=message, scope=scope)
+                    job = hub.submit(
+                        cmd,
+                        list(args),
+                        message=message,
+                        scope=scope,
+                        long=long_running,
+                    )
                 except ValueError as error:
                     self._error(403, str(error))
                     return
@@ -2114,7 +2791,7 @@ async function tick() {{
       const secs = j.durationSec == null ? '-' : j.durationSec + 's';
       return `<tr class="${{j.status}}" data-id="${{j.id}}">
         <td>${{j.status}}</td><td>${{j.exitCode ?? ''}}</td><td>${{secs}}</td>
-        <td>${{j.argv.map(a => a.replace(/</g,'&lt;')).join(' ')}}</td>
+        <td>${{j.long ? '<span class="muted">long </span>' : ''}}${{j.argv.map(a => a.replace(/</g,'&lt;')).join(' ')}}</td>
         <td class="muted">${{j.summary ?? ''}}</td></tr>`;
     }}).join('');
     document.getElementById('rows').innerHTML = rows;

@@ -16,5 +16,15 @@ tests/.tmp-scope/
 tests/.tmp-scope-logs/
 tests/.tmp-registry/
 
+# Scratch trees of the Node-toolchain tests: a fake npm-shaped tree, a fake
+# project whose vite/vitest are Node scripts, and their job logs.
+tests/.tmp-node/
+tests/.tmp-node-project/
+tests/.tmp-node-logs/
+
 # Ruff's cache, created by `ruff check` in the repository root.
 .ruff_cache/
+
+# A pnpm store, which pnpm creates next to the workspace root whenever anything
+# installs here (inside the sandbox that is the only writable store location).
+.pnpm-store/

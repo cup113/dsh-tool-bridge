@@ -1,6 +1,6 @@
 ---
 name: tool-bridge
-description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build), a git write (add, commit, restore), or a Flutter ARB localization edit is needed. Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command.
+description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build), a Node toolchain command (pnpm install/run, vite build or dev, vitest, svelte-check, tsc), a git write (add, commit, restore), or a Flutter ARB localization edit is needed. Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command.
 ---
 
 <what-to-do>
@@ -16,8 +16,11 @@ no documentation. The repository's `CONTEXT.md` (vocabulary) and `docs/adr/`
 Use this whenever a toolchain command would otherwise need a one-shot
 `danger-full-access` escalation. In the DSH file sandbox (`workspace-write`),
 Flutter/Dart tooling cannot run at all (it fails writing the SDK lockfile, or
-hangs), and every git write is denied because the git dir lives outside the
-workspace. This server is started **once** per session with that escalation and
+hangs), every git write is denied because the git dir lives outside the
+workspace, and a Node toolchain dies on `spawn EPERM` — the sandbox cannot create
+the named pipes libuv uses for child stdio, which is what takes down `vite`'s
+Windows `net use` probe, `vitest`'s default forks pool and `esbuild`. This server
+is started **once** per session with that escalation and
 does the work from then on; every client call below is an ordinary confined
 command.
 
@@ -235,7 +238,82 @@ $r.result.untranslated  # null, or {file, lines, content} — a warning, not a f
   below. Run `/health` first if you are unsure whether the deployed bridge has
   this sub-tool: it reports `tools`.
 
-## 6. Stop it
+## 6. Node toolchain: pnpm, vite, vitest, svelte-check
+
+`pnpm` is accepted by verb (`install`, `i`, `add`, `remove`, `update`, `rebuild`,
+`dedupe`, `run`, `exec`, `why`, `list`, `outdated`, `audit`, `licenses`), and the
+project's own tools are commands of their own:
+
+```powershell
+$r = Invoke-Run 'pnpm' @('install')                       # also runs the build scripts
+$r = Invoke-Run 'vitest' @('run','--pool=threads')        # digest + known-failure split
+$r = Invoke-Run 'vite' @('build')
+$r = Invoke-Run 'svelte-check' @('--tsconfig','./tsconfig.json')
+$r = Invoke-Run 'tsc' @('--noEmit')                       # inside the project
+```
+
+What the surface is, and why:
+
+- **The accepted names are `vite`, `vitest`, `svelte-check`, `svelte-kit`, `tsc`**
+  plus `pnpm` (`/health.commands` lists them). Each is resolved inside the pinned
+  cwd's `node_modules` by reading the package's `bin` field — so `tsc` finds
+  `typescript`, `svelte-kit` finds `@sveltejs/kit` — and runs under `node`.
+  Never through `.bin/*.CMD`: that is a shell wrapper, and running it would put
+  `cmd.exe` back in the middle of an argv that is supposed to have no shell.
+  A tool that is not installed is a job failure naming the missing
+  `node_modules/<pkg>/package.json`, so run `pnpm install` first.
+- **A script binary must be run from the pinned cwd.** It is looked up in
+  `<cwd>/node_modules` and nowhere else, so a bridge pinned at the wrong
+  directory fails loudly rather than running a different project's vite.
+- **`--pool=threads` is the flag to remember for vitest.** Vitest's default
+  `forks` pool uses an IPC pipe, and pipes are exactly what the sandbox forbids
+  (`spawn EPERM`), so the default pool fails *in a confined session*; the threads
+  pool works. Under the bridge it does not matter — but keeping it makes a
+  command portable between the two, and it is what makes a confined run possible
+  at all.
+- **`pnpm exec` takes only those five names.** Measured, `pnpm exec node
+  --version` and `pnpm exec cmd /c echo hi` both work because pnpm falls back to
+  `PATH`; accepting that would be general command execution behind an
+  allowlisted verb. Everything else is a `403` that names `pnpm run <script>`.
+  `-c`/`--shell-mode` is refused with it.
+- **The cwd-retargeting flags are refused** on every verb: `-C`, `--dir`,
+  `--prefix`, `-w`, `--workspace-root`, `-g`, `--global`. The pinned cwd is an
+  ADR-0002 invariant, and `-g` leaves the project entirely. `pnpm dlx`,
+  `publish`, `config`, `setup` and `store` are absent by omission.
+
+### Long jobs: dev servers and watch mode
+
+A job that is expected to run **until you kill it** goes to its own lane, so it
+cannot starve the builds behind it:
+
+```powershell
+# guessed onto the long lane, and it KEEPS RUNNING: wait returns, the job does not
+$body=@{cmd='vite';args=@('dev','--port','5199');long=$true;wait=$true;timeoutSec=60}|ConvertTo-Json -Compress
+$r = Invoke-RestMethod "http://127.0.0.1:$port/run" -Method Post -Headers $h -Body $body -TimeoutSec 120
+$r.status     # "running" — read the log, then kill it when done
+$r.resolvedArgv
+$r.tail       # "ready in 557 ms", the URL it bound, ...
+
+# stop it when you are finished with it
+Invoke-RestMethod "http://127.0.0.1:$port/jobs/$($r.id)/kill" -Method Post -Headers $h
+```
+
+- **Inferred**: `vite dev`/`serve`/`preview`, bare `vite`, `vitest` without
+  `run`/`--run`, and `pnpm run <script>` for a script named
+  `dev`/`start`/`serve`/`watch`/`storybook`. `--help`/`--version` probes are
+  excluded.
+- **`long: true` overrides the guess either way** — pass it when a script has an
+  unusual name, or `long: false` when a long-looking name is actually one-shot.
+  The guess exists because the two error directions are not symmetric: a dev
+  server left on the queue lane starves every build behind it, while a one-shot
+  job put on the long lane merely occupies that lane until it exits.
+- A long job still has a log, a `summary`, `aheadOf` and a kill like any other
+  job; the job JSON just adds `"long": true`, and the status page marks it.
+- Killing works even where `taskkill` is refused (it is, in this sandbox): the
+  bridge falls back to terminating the process it spawned, and logs
+  `TOOLHUB KILL` when it does.
+
+## 7. Stop it
 
 `POST /stop` when work is done (`Invoke-RestMethod ".../stop" -Method Post
 -Headers $h`). If it is left running, the parent watchdog ends it when the
@@ -250,9 +328,9 @@ session binds a new random port.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/health` | liveness + `tools` (the sub-tools this bridge supports) + `dartFormatExe` (the formatter pin, or null); no token |
+| GET | `/health` | liveness + `tools` (the sub-tools this bridge supports) + `commands` (the accepted executables) + `dartFormatExe` (the formatter pin, or null); no token |
 | GET | `/?token=…` | human status page: job list + live log tail (browser-friendly; opened automatically at boot) |
-| POST | `/run` | `{"cmd","args","message","scope","wait","timeoutSec","grep","tail"}` → job; `wait:true` blocks until done |
+| POST | `/run` | `{"cmd","args","message","scope","long","wait","timeoutSec","grep","tail"}` → job; `wait:true` blocks until done |
 | POST | `/tools/arb-edit` | `{"groups","dryRun","wait","timeoutSec","grep","tail"}` → job with a structured `result` |
 | GET | `/jobs` | all jobs, newest last (no logs, no failure lists) |
 | GET | `/jobs/<id>?tail=N&grep=P` | one job + last N log lines (default 200), or the last N lines matching the `P` regex |
@@ -372,7 +450,23 @@ Request body:
 [{"file": "C:/ws/test/desktop/alpha_test.dart", "name": "alpha refuses a bad key", "didNotComplete": false}]
 ```
 
-Where it comes from matters when it looks thin:
+The same fields come back for a **vitest** run — `vitest run` and
+`pnpm exec vitest run` are recognised by their argv, and `pnpm run test` by the
+reporter's own markers in the log, because the script name is the project's word
+for it. What differs:
+
+- `file`/`name` are split on vitest's ` > `: `FAIL  src/App.test.ts > add > fails
+  on purpose` becomes `file: "src/App.test.ts"`, `name: "add > fails on purpose"`
+  (the full test name, which is what a registry entry matches on).
+- A suite that never loaded has no `FAIL <path> > ...` line, only the
+  `Failed Suites` section, and its summary line reads `Tests  no tests`. Those
+  are counted into `counts.failed` and reported as `loading <path>`, the same
+  shape the flutter digest uses — so one registry rule claims it on either runner.
+- `summary` reaching you at all proves the run finished: vitest writes its
+  `Tests` line last, so a killed run reports `see log` with whatever inventory it
+  had.
+
+Where a **flutter** digest comes from matters when it looks thin:
 
 - `failures` is built from the `[E]` progress lines, **not** from the reporter's
   `Failing tests:` block: that block lists at most four entries (then
@@ -465,13 +559,17 @@ split, so a red local run can be read instead of re-diagnosed:
 - The registry is read per job from the pinned cwd, so adding an entry needs no
   restart. It lives in the project, so it can be committed and shared.
 
-## Git: what it will and will not run
+## Git and pnpm: what it will and will not run
 
 - `flutter` and `dart`: any subcommand, any arguments.
+- `pnpm`: the named verbs in section 6 — no `dlx`, no `publish`, no `config`,
+  no `store`, and no cwd-retargeting flag. `exec` takes a project script binary.
+- the project's own `vite`, `vitest`, `svelte-check`, `svelte-kit`, `tsc`.
 - `git`: only `status`, `diff`, `log`, `add`, `commit`, `branch`, `restore` —
   and `branch` refuses `-d/-D/--delete/-m/-M/--move`.
-- Nothing else. **No `git push`** (the GitHub token must never live in a
-  long-running process — keep using the documented inline-token recipe), no
+- Nothing else: no `npm`, no `npx`, no raw `node`, no `python`. **No `git push`**
+  (the GitHub token must never live in a long-running process — keep using the
+  documented inline-token recipe), no
   `reset`/`clean`/`checkout`/`switch`/`stash` in any form. A `checkout` refusal
   names its substitute: `git restore -- <path>`.
 - **`restore` is path-scoped on purpose.** It accepts only literal, relative,
@@ -516,11 +614,12 @@ actually ran. A `dart format` job under a formatter pin launches the pinned
 with `GIT_TERMINAL_PROMPT=0`, so nothing can block on
 a credential or signing prompt that this process has no terminal to answer.
 
-Jobs run **one at a time** on purpose: concurrent Flutter invocations fight
+Jobs run **one at a time per lane**: concurrent Flutter invocations fight
 over `build/` (a locked `build/native_assets/windows/sqlite3.dll` has already
-broken a run). `POST /run` therefore queues behind whatever is running, and the
-response reports `aheadOf` — how many unfinished jobs are in front of yours,
-counting the one that is currently running.
+broken a run). `POST /run` therefore queues behind whatever is running **on its
+own lane**, and the response reports `aheadOf` — how many unfinished jobs are in
+front of yours on that lane, counting the one that is currently running. A long
+job on the other lane is not counted, because it is not in your way.
 
 ## Baseline attribution: "is this failure mine?"
 
@@ -551,7 +650,10 @@ what would have to change).
 - Server-side log filtering, so a ten-minute suite's noise does not have to be
   pulled into the agent's context and grepped by hand.
 - Process control: a hung `flutter_tester`/`dart` can be killed by id, with its
-  whole tree.
+  whole tree — and a dev server, which is *supposed* to be running, is killed the
+  same way without the tree-kill having to work.
+- Two lanes, so a `vite dev` that is waiting to be killed cannot starve the builds
+  and test runs behind it.
 
 It does **not** make compiles faster: Flutter has no build daemon, so each job
 is still a fresh process. The wins are friction, correctness and observability.
@@ -571,6 +673,11 @@ is still a fresh process. The wins are friction, correctness and observability.
   surface buys is *recovery cost and surprise* for a fallible one: every refused
   command is one nobody can lose work to. Refusals are therefore argued as "this
   can destroy unnamed work", not as "this escalates privilege".
+- `pnpm install` runs the project's dependency build scripts and `pnpm run` runs
+  whatever a `package.json` says, with that same access — the Node surface widens
+  *what a legitimate build does*, not what is reachable. `pnpm exec` is the case
+  where that reasoning would break, which is why it is narrowed to a project
+  script binary rather than trusted: measured, it also runs things on `PATH`.
 - The real trust decision is the boot approval: the process holds that access for
   its lifetime, which is why the escalation is requested once, explicitly, and
   why the human gets the status page at boot.
@@ -639,8 +746,35 @@ is still a fresh process. The wins are friction, correctness and observability.
   ignored elsewhere), `file` (a relative path inside the project), and whether a
   `name` is the *full* test name as the reporter prints it (`failures[i].name`
   shows it verbatim — copy from there, or use `match`).
-- **Job stuck in `queued`** → something ahead of it is still running; check
-  `GET /jobs` and kill it if it is a hang.
+- **Job stuck in `queued`** → something ahead of it is still running **on the
+  same lane**; check `GET /jobs` and kill it if it is a hang. A job waiting behind
+  a `long` job (a dev server) is normal and will not start until that one is
+  killed.
+- **`403 pnpm flag not allowed: '-C'`** (or `--prefix`, `-g`, `-w`) → the flag
+  would run outside the pinned cwd, which no request can change (ADR-0002). Start
+  a bridge with the right `--cwd`, or drop the flag.
+- **`403 pnpm exec target not allowed: 'node'`** → `pnpm exec` runs anything it
+  finds on `PATH`, so only the project's own script binaries are accepted. Run a
+  package script with `pnpm run <script>` instead.
+- **`node is not on PATH`** → the bridge needs `node` to launch a script binary;
+  install Node or put it on `PATH` for the process that starts the bridge.
+- **`vite is not installed in <cwd>: ... is missing`** → the pinned cwd has no
+  `node_modules/<pkg>`. Run `pnpm install` first, or check that the bridge was
+  started with the project's own directory.
+- **`vite`/`vitest` fails with `spawn EPERM`** → the sandbox, not the project. It
+  denies the *named pipes* libuv needs for child stdio, which is what Vite's
+  Windows `net use` probe and vitest's default forks pool use. Two traps:
+  - Running it in the confined session instead of through the bridge: use the
+    bridge, and for vitest add `--pool=threads`.
+  - **Running it through a bridge that was itself started confined.** A bridge
+    booted under `workspace-write` (typically because `--selfcheck` was skipped)
+    gives *its own* children file stdio, so `pnpm install`, `svelte-check` and
+    `tsc` work — but Vite's probe runs inside the vite process, where the sandbox
+    still applies. Measured: confined bridge → `vite build` exit 1 with
+    `spawn EPERM`; elevated bridge → exit 0 and `dist/` written. So start the
+    bridge normally and let its self-check fail, then retry it elevated.
+  - Vite 7 and earlier cannot be rescued even outside the bridge (esbuild must
+    spawn a binary); see the repository's `docs/vite-vitest-sandbox-findings.md`.
 - **`--watch-parent` prints "parent pid already gone at boot"** → the watchdog
   disabled itself (it never kills a server whose parent it cannot see). The
   server still works; stop it with `POST /stop`.
@@ -672,8 +806,9 @@ is still a fresh process. The wins are friction, correctness and observability.
 wipes (`clean`, `git restore .`), `stash`, `checkout`/`switch`, per-job `cwd`
 and worktree-per-baseline entries, detached/persistent mode across sessions,
 arbitrary command execution *by name* (the bridge is not a privilege boundary —
-see the security model), a per-request formatter or SDK override (the pin is
-boot-scoped, like the cwd) and a scope for any command but `dart format`, `dart
+see the security model), `pnpm dlx`/`publish`/`config`/`store`, `pnpm exec` for
+anything but a project script binary, a per-request formatter or SDK override (the
+pin is boot-scoped, like the cwd) and a scope for any command but `dart format`, `dart
 analyze`/`fix` and `flutter analyze`/`fix`, copying build caches between
 worktrees (CMake/ninja
 state is path-keyed, so copying forces a full reconfigure while the genuinely

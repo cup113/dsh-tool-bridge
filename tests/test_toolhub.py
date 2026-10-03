@@ -10,7 +10,12 @@ They read the fixtures under `tests/fixtures/` and write nothing, except the
 `tests/.tmp-arbtool/` and remove it again (a real edit has to land somewhere,
 and the sandbox permits writes inside the workspace), plus two scratch
 directories for the formatter-pin and scope tests (`.tmp-format-pin/`,
-`.tmp-scope/`) — both removed by the tests that make them.
+`.tmp-scope/`) — both removed by the tests that make them. The Node toolchain
+tests use `.tmp-node/` (a fake npm-shaped tree for the launcher guards),
+`.tmp-node-project/` (a project whose `vite` and `vitest` are fake Node scripts,
+so the lanes and the digest are exercised by real processes) and
+`.tmp-node-logs/` for job logs; all three are removed by the classes that make
+them.
 """
 
 from __future__ import annotations
@@ -1735,6 +1740,988 @@ class KnownFailureRegistryTests(unittest.TestCase):
         }
         self.assertNotIn("baseline", job.to_json())
         self.assertIn("baseline", job.to_json(tail_lines=5))
+
+
+# ---------------------------------------------------------------------------
+# Node toolchain: the pnpm surface, script binaries, the vitest digest, lanes
+# ---------------------------------------------------------------------------
+
+# A scratch npm-shaped tree for the launcher tests, a scratch project for the
+# jobs that really spawn Node, and the log directory both share.
+NODE_SCRATCH = HERE / ".tmp-node"
+NODE_PROJECT = HERE / ".tmp-node-project"
+NODE_LOG_SCRATCH = HERE / ".tmp-node-logs"
+
+# What a fake project's own tools print and do. The server stays up (a pending
+# timer keeps Node alive) because that is what "long job" means; the suite prints
+# a real passing vitest report and exits, so the digest is exercised end to end.
+FAKE_SERVER = "console.log('dev server up');\nsetTimeout(() => {}, 600000);\n"
+FAKE_SUITE = (
+    "console.log('');\n"
+    "console.log(' RUN  v5.0.3 C:/ws');\n"
+    "console.log('');\n"
+    "console.log(' Test Files  1 passed (1)');\n"
+    "console.log('      Tests  2 passed (2)');\n"
+)
+
+
+def write_package(
+    root: pathlib.Path,
+    package: str,
+    bin_field: object,
+    entry: str | None,
+    source: str = "// fake\n",
+) -> pathlib.Path:
+    """A fake installed package, laid out the way pnpm leaves it.
+
+    `entry` is created inside the package directory; None skips creating it,
+    which is how a `bin` field pointing outside the package is set up.
+    """
+    package_dir = root.joinpath("node_modules", *package.split("/"))
+    package_dir.mkdir(parents=True, exist_ok=True)
+    (package_dir / "package.json").write_text(
+        json.dumps({"name": package, "bin": bin_field}), encoding="utf-8"
+    )
+    if entry is None:
+        return package_dir
+    target = package_dir / entry
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8")
+    return target
+
+
+def build_fake_project(root: pathlib.Path) -> None:
+    """A project whose own `vite` and `vitest` are fake Node scripts.
+
+    Written in place rather than recreated: two test classes share this tree, and
+    a just-killed Node process can still hold a handle on it for a moment, which
+    a `rmtree` + `mkdir` pair would turn into a spurious failure.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    write_package(root, "vite", {"vite": "bin/vite.js"}, "bin/vite.js", FAKE_SERVER)
+    write_package(root, "vitest", "./vitest.mjs", "vitest.mjs", FAKE_SUITE)
+
+
+def remove_tree(path: pathlib.Path, attempts: int = 10) -> None:
+    """Removes a scratch tree, waiting out a process that is still dying.
+
+    A just-killed Node process can hold a handle on its script's directory for a
+    moment, which makes `rmtree` fail with `PermissionError` on Windows — and
+    `ignore_errors=True` would then leave the tree behind for the next run to
+    trip over.
+    """
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.2)
+
+
+class PatchedWhich:
+    """`shutil.which` as a lookup table, restored on exit.
+
+    `resolve_pnpm` has to be shown working against the wrapper layouts found in
+    the wild (nvm4w, corepack), which means pointing the lookup at scratch files
+    instead of the machine's own pnpm.
+    """
+
+    def __init__(self, mapping: dict[str, str | None]) -> None:
+        self.mapping = mapping
+        self.saved: Any = None
+
+    def __enter__(self) -> PatchedWhich:
+        self.saved = server.shutil.which
+
+        def fake_which(name: str) -> str | None:
+            if name in self.mapping:
+                return self.mapping[name]
+            return self.saved(name)
+
+        server.shutil.which = fake_which
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        server.shutil.which = self.saved
+        return False
+
+
+class PnpmSurfaceTests(unittest.TestCase):
+    """`pnpm` is verb-guarded, and `exec` is not a general command runner."""
+
+    ALLOWED: ClassVar[list[list[str]]] = [
+        ["pnpm", "install"],
+        ["pnpm", "install", "--no-frozen-lockfile"],
+        ["pnpm", "add", "-D", "svelte"],
+        ["pnpm", "update"],
+        ["pnpm", "run", "build"],
+        ["pnpm", "run", "dev", "--", "--host"],
+        ["pnpm", "exec", "vitest", "run", "--pool=threads"],
+        ["pnpm", "exec", "--", "vitest", "run"],
+        ["pnpm", "why", "svelte"],
+    ]
+
+    REFUSED: ClassVar[list[list[str]]] = [
+        ["pnpm"],
+        ["pnpm", "--version"],
+        ["pnpm", "publish"],
+        ["pnpm", "dlx", "create-svelte"],
+        ["pnpm", "store", "prune"],
+        ["pnpm", "-C", "elsewhere", "run", "build"],
+        ["pnpm", "install", "--prefix", "elsewhere"],
+        ["pnpm", "install", "-g", "typescript"],
+        ["pnpm", "run", "build", "-w"],
+        ["pnpm", "exec", "node", "--version"],
+        ["pnpm", "exec", "cmd", "/c", "echo hi"],
+        ["pnpm", "exec", "./node_modules/.bin/vitest", "run"],
+        ["pnpm", "exec", "-c", "vitest run"],
+        ["pnpm", "exec"],
+    ]
+
+    def test_allowed_forms(self) -> None:
+        for argv in self.ALLOWED:
+            with self.subTest(argv=argv):
+                server.validate(argv)
+
+    def test_refused_forms(self) -> None:
+        for argv in self.REFUSED:
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError):
+                    server.validate(argv)
+
+    def test_a_retargeting_flag_says_what_it_would_have_done(self) -> None:
+        """The refusal has to read as "run somewhere else", not as a typo."""
+        for argv in (
+            ["pnpm", "-C", "elsewhere", "install"],
+            ["pnpm", "install", "--prefix=elsewhere"],
+            ["pnpm", "install", "-g", "typescript"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError) as caught:
+                    server.validate(argv)
+                self.assertIn("pinned", str(caught.exception))
+
+    def test_an_exec_target_outside_the_tool_set_names_the_substitute(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            server.validate(["pnpm", "exec", "node", "-e", "1"])
+        self.assertIn("pnpm run", str(caught.exception))
+
+    def test_the_script_binaries_are_commands_of_their_own(self) -> None:
+        for name in sorted(server.SCRIPT_BINARIES):
+            with self.subTest(name=name):
+                server.validate([name, "--version"])
+
+    def test_an_unknown_command_lists_what_is_allowed(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            server.validate(["npm", "install"])
+        message = str(caught.exception)
+        self.assertIn("pnpm", message)
+        self.assertIn("vitest", message)
+
+
+class ScriptBinaryLaunchTests(unittest.TestCase):
+    """A script binary runs as `node <pkg>/<bin>`, out of the pinned cwd."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        NODE_SCRATCH.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        remove_tree(NODE_SCRATCH)
+
+    def setUp(self) -> None:
+        remove_tree(NODE_SCRATCH / "node_modules")
+
+    def test_bin_declared_as_an_object(self) -> None:
+        target = write_package(
+            NODE_SCRATCH, "vite", {"vite": "bin/vite.js"}, "bin/vite.js"
+        )
+        launch, extra_env = server.resolve_launch(
+            ["vite", "build"], cwd=str(NODE_SCRATCH)
+        )
+        self.assertEqual(launch, [server.node_exe(), str(target), "build"])
+        self.assertEqual(extra_env, {})
+
+    def test_bin_declared_as_a_string(self) -> None:
+        target = write_package(NODE_SCRATCH, "vitest", "./vitest.mjs", "vitest.mjs")
+        launch, _ = server.resolve_launch(["vitest", "run"], cwd=str(NODE_SCRATCH))
+        self.assertEqual(launch[1], str(target))
+
+    def test_a_command_whose_package_is_named_differently(self) -> None:
+        target = write_package(
+            NODE_SCRATCH,
+            "typescript",
+            {"tsc": "./bin/tsc", "tsserver": "./bin/tsserver"},
+            "bin/tsc",
+        )
+        launch, _ = server.resolve_launch(["tsc", "--noEmit"], cwd=str(NODE_SCRATCH))
+        self.assertEqual(launch[1], str(target))
+
+    def test_a_scoped_package(self) -> None:
+        target = write_package(
+            NODE_SCRATCH, "@sveltejs/kit", {"svelte-kit": "src/cli.js"}, "src/cli.js"
+        )
+        launch, _ = server.resolve_launch(["svelte-kit", "sync"], cwd=str(NODE_SCRATCH))
+        self.assertEqual(launch[1], str(target))
+
+    def test_a_package_that_is_not_installed_names_its_manifest(self) -> None:
+        with self.assertRaises(FileNotFoundError) as caught:
+            server.resolve_launch(["vite", "build"], cwd=str(NODE_SCRATCH))
+        self.assertIn("node_modules", str(caught.exception))
+
+    def test_a_bin_entry_escaping_its_package_is_refused(self) -> None:
+        write_package(NODE_SCRATCH, "vite", {"vite": "../../../outside.js"}, None)
+        with self.assertRaises(FileNotFoundError) as caught:
+            server.resolve_launch(["vite", "build"], cwd=str(NODE_SCRATCH))
+        self.assertIn("outside its package", str(caught.exception))
+
+    def test_the_pinned_cwd_is_what_is_searched(self) -> None:
+        """A package next to *this* test file must not be picked up."""
+        write_package(NODE_SCRATCH, "vite", {"vite": "bin/vite.js"}, "bin/vite.js")
+        with self.assertRaises(FileNotFoundError):
+            server.resolve_launch(["vite", "build"], cwd=str(HERE))
+
+
+class PnpmLaunchTests(unittest.TestCase):
+    """`pnpm` on PATH is a wrapper, so its JavaScript entry is launched."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        NODE_SCRATCH.mkdir(parents=True, exist_ok=True)
+        nvm = NODE_SCRATCH / "nvm4w"
+        cls.entry = nvm / "node_modules" / "pnpm" / "bin" / "pnpm.mjs"
+        cls.entry.parent.mkdir(parents=True)
+        cls.entry.write_text("// pnpm\n", encoding="utf-8")
+        cls.wrapper = nvm / "pnpm.CMD"
+        cls.wrapper.write_text(
+            "@ECHO off\n"
+            'endLocal & "%_prog%"  "%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs" %*\n',
+            encoding="utf-8",
+        )
+        # A corepack-managed install keeps pnpm elsewhere: only the wrapper names
+        # the entry point, which is what the shim reader is for.
+        corepack = NODE_SCRATCH / "corepack"
+        cls.corepack_entry = corepack / "node_modules" / "corepack" / "dist" / "pnpm.js"
+        cls.corepack_entry.parent.mkdir(parents=True)
+        cls.corepack_entry.write_text("// corepack pnpm\n", encoding="utf-8")
+        cls.corepack_wrapper = corepack / "pnpm.CMD"
+        cls.corepack_wrapper.write_text(
+            '@ECHO off\nnode "%dp0%\\node_modules\\corepack\\dist\\pnpm.js" %*\n',
+            encoding="utf-8",
+        )
+        cls.standalone = NODE_SCRATCH / "standalone" / "pnpm.exe"
+        cls.standalone.parent.mkdir(parents=True)
+        cls.standalone.write_text("", encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(NODE_SCRATCH, ignore_errors=True)
+
+    def test_the_usual_layout(self) -> None:
+        with PatchedWhich({"pnpm": str(self.wrapper)}):
+            self.assertEqual(
+                server.resolve_pnpm(), [server.node_exe(), str(self.entry)]
+            )
+
+    def test_a_wrapper_that_only_names_its_own_entry(self) -> None:
+        with PatchedWhich({"pnpm": str(self.corepack_wrapper)}):
+            self.assertEqual(
+                server.resolve_pnpm(), [server.node_exe(), str(self.corepack_entry)]
+            )
+
+    def test_a_standalone_pnpm_exe_is_used_as_it_is(self) -> None:
+        with PatchedWhich({"pnpm": str(self.standalone)}):
+            self.assertEqual(server.resolve_pnpm(), [str(self.standalone)])
+
+    def test_no_pnpm_on_path(self) -> None:
+        with PatchedWhich({"pnpm": None}):
+            with self.assertRaises(FileNotFoundError):
+                server.resolve_pnpm()
+
+    def test_a_wrapper_with_no_findable_entry(self) -> None:
+        orphan = NODE_SCRATCH / "orphan" / "pnpm.CMD"
+        orphan.parent.mkdir(parents=True)
+        orphan.write_text("@ECHO off\necho nothing to see\n", encoding="utf-8")
+        with PatchedWhich({"pnpm": str(orphan)}):
+            with self.assertRaises(FileNotFoundError):
+                server.resolve_pnpm()
+
+    def test_the_job_launches_node_plus_the_entry(self) -> None:
+        with PatchedWhich({"pnpm": str(self.wrapper)}):
+            launch, _ = server.resolve_launch(["pnpm", "run", "build"])
+            self.assertEqual(
+                launch, [server.node_exe(), str(self.entry), "run", "build"]
+            )
+
+
+class VitestDigestTests(unittest.TestCase):
+    """The vitest reporter, read the way the flutter reporter already was."""
+
+    VITEST: ClassVar[list[str]] = ["vitest", "run"]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        NODE_LOG_SCRATCH.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(NODE_LOG_SCRATCH, ignore_errors=True)
+
+    def digest(self, name: str, argv: list[str] | None = None) -> Mapping[str, Any]:
+        return server.analyze_test_log(argv or self.VITEST, fixture(name))
+
+    def scratch_log(self, name: str, text: str) -> str:
+        path = NODE_LOG_SCRATCH / name
+        path.write_text(text, encoding="utf-8")
+        return str(path)
+
+    def test_counts_summary_and_flavor(self) -> None:
+        digest = self.digest("vitest_two_files_failed.txt")
+        self.assertEqual(digest["flavor"], "vitest")
+        self.assertEqual(digest["counts"], {"passed": 3, "skipped": 0, "failed": 1})
+        self.assertEqual(digest["summary"], "3 passed, 1 failed")
+
+    def test_the_failure_inventory_carries_the_suite_and_the_full_name(self) -> None:
+        digest = self.digest("vitest_two_files_failed.txt")
+        self.assertEqual(
+            digest["failures"],
+            [
+                {
+                    "file": "src/App.test.ts",
+                    "name": "add > fails on purpose",
+                    "didNotComplete": False,
+                }
+            ],
+        )
+
+    def test_a_passing_run_has_counts_and_no_failures(self) -> None:
+        digest = self.digest("vitest_passing.txt")
+        self.assertEqual(digest["counts"], {"passed": 2, "skipped": 0, "failed": 0})
+        self.assertEqual(digest["summary"], "2 passed")
+        self.assertEqual(digest["failures"], [])
+
+    def test_a_suite_that_never_loaded_counts_as_a_failure(self) -> None:
+        """`Tests  no tests` with a red run: the suite failure is the failure."""
+        digest = self.digest("vitest_load_failure.txt")
+        self.assertEqual(digest["counts"], {"passed": 0, "skipped": 0, "failed": 1})
+        self.assertEqual(digest["summary"], "0 passed, 1 failed")
+        self.assertEqual(
+            digest["failures"],
+            [
+                {
+                    "file": "src/Broken.test.ts",
+                    "name": "loading src/Broken.test.ts",
+                    "didNotComplete": False,
+                }
+            ],
+        )
+
+    def test_pnpm_run_test_is_recognised_from_the_log(self) -> None:
+        """The script name is the project's word for it, so content decides."""
+        digest = server.analyze_test_log(
+            ["pnpm", "run", "test"], fixture("vitest_two_files_failed.txt")
+        )
+        self.assertEqual(digest["flavor"], "vitest")
+        self.assertEqual(digest["summary"], "3 passed, 1 failed")
+
+    def test_a_pnpm_job_with_a_foreign_log_has_no_digest(self) -> None:
+        digest = server.analyze_test_log(
+            ["pnpm", "run", "build"], fixture("expanded_failed.txt")
+        )
+        self.assertIsNone(digest["flavor"])
+        self.assertIsNone(digest["summary"])
+
+    def test_a_killed_run_keeps_the_inventory_but_claims_no_counts(self) -> None:
+        log = self.scratch_log(
+            "killed.txt",
+            "\n RUN  v5.0.3 C:/ws\n\n"
+            " ❯ src/App.test.ts (2 tests | 1 failed) 6ms\n\n"
+            "⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯\n\n"
+            " FAIL  src/App.test.ts > add > fails on purpose\n"
+            "AssertionError: expected 3 to be 4\n",
+        )
+        digest = server.analyze_test_log(self.VITEST, log)
+        self.assertIsNone(digest["counts"])
+        self.assertEqual(digest["summary"], "see log")
+        self.assertEqual(len(digest["failures"]), 1)
+
+    def test_an_absolute_reported_path_is_kept(self) -> None:
+        log = self.scratch_log(
+            "absolute.txt",
+            " FAIL  C:/ws/src/App.test.ts > add > fails on purpose\n"
+            "      Tests  1 failed (1)\n",
+        )
+        digest = server.analyze_test_log(self.VITEST, log)
+        self.assertEqual(digest["failures"][0]["file"], "C:/ws/src/App.test.ts")
+        self.assertEqual(digest["failures"][0]["name"], "add > fails on purpose")
+        self.assertEqual(digest["summary"], "0 passed, 1 failed")
+
+    def test_skipped_and_todo_are_both_not_run(self) -> None:
+        """`skipped` comes from the total, so a `todo` does not vanish."""
+        log = self.scratch_log(
+            "counts.txt", "      Tests  2 passed | 1 failed | 1 todo (4)\n"
+        )
+        digest = server.analyze_test_log(self.VITEST, log)
+        self.assertEqual(digest["counts"], {"passed": 2, "skipped": 1, "failed": 1})
+
+    def test_a_flutter_digest_still_says_so(self) -> None:
+        digest = server.analyze_test_log(
+            ["flutter", "test"], fixture("expanded_failed.txt")
+        )
+        self.assertEqual(digest["flavor"], "flutter")
+
+    def test_the_registry_split_applies_to_a_vitest_run(self) -> None:
+        digest = self.digest("vitest_two_files_failed.txt")
+        registry: Any = {
+            "path": ".toolbridge/known-failures.json",
+            "exists": True,
+            "entries": server.parse_known_failures(
+                {
+                    "entries": [
+                        {"match": "^add > fails", "kind": "flaky", "reason": "races"}
+                    ]
+                }
+            ),
+            "error": None,
+        }
+        report = server.baseline_report(digest["failures"], digest["counts"], registry)
+        self.assertEqual((report["known"], report["new"]), (1, 0))
+        self.assertEqual(
+            server.summarize_with_baseline(digest["summary"], report),
+            "3 passed, 1 failed (1 known, 0 new)",
+        )
+
+
+class KillFallbackProcess:
+    """A process handle that records whether it was terminated directly."""
+
+    pid = 31337
+
+    def __init__(self) -> None:
+        self.killed = False
+        self.exited = False
+
+    def poll(self) -> int | None:
+        return 1 if self.exited else None
+
+    def kill(self) -> None:
+        self.killed = True
+        self.exited = True
+
+
+class PatchedRun:
+    """`subprocess.run` replaced by one canned result, restored on exit."""
+
+    def __init__(self, returncode: int) -> None:
+        self.returncode = returncode
+        self.calls: list[list[str]] = []
+        self.saved: Any = None
+
+    def __enter__(self) -> PatchedRun:
+        self.saved = server.subprocess.run
+
+        def fake_run(argv: list[str], **kwargs: Any) -> Any:
+            self.calls.append(list(argv))
+            return types.SimpleNamespace(
+                returncode=self.returncode, stdout=b"", stderr=b""
+            )
+
+        server.subprocess.run = fake_run
+        return self
+
+    def __exit__(self, *exc: object) -> bool:
+        server.subprocess.run = self.saved
+        return False
+
+
+class KillFallbackTests(unittest.TestCase):
+    """A refused `taskkill` must not leave a dev server running unattended.
+
+    Measured in the DSH sandbox: `taskkill /F /T` answers `access denied` (rc 1)
+    while the process is alive, so the tree kill silently did nothing and the
+    worker stayed in `process.wait()` — the lane never moved again. The handle
+    the bridge already owns is the fallback.
+    """
+
+    def job_with(self, process: KillFallbackProcess) -> Any:
+        job = server.Job(["vite", "dev"], ".", os.devnull)
+        job.status = "running"
+        job.set_process(process)
+        return job
+
+    def test_a_refused_tree_kill_still_terminates_the_process(self) -> None:
+        process = KillFallbackProcess()
+        job = self.job_with(process)
+        with PatchedRun(1) as run:
+            self.assertTrue(job.kill())
+        self.assertTrue(process.killed)
+        self.assertEqual(job.status, "killed")
+        if server.IS_WINDOWS:
+            self.assertEqual(run.calls[0][0], "taskkill")
+
+    def test_a_tree_kill_that_worked_is_left_alone(self) -> None:
+        if not server.IS_WINDOWS:
+            self.skipTest("taskkill is the Windows path")
+        process = KillFallbackProcess()
+        job = self.job_with(process)
+        with PatchedRun(0):
+            self.assertTrue(job.kill())
+        self.assertFalse(process.killed)
+        self.assertEqual(job.status, "killed")
+
+    def test_a_process_that_already_exited_is_not_killed(self) -> None:
+        process = KillFallbackProcess()
+        process.exited = True
+        job = self.job_with(process)
+        with PatchedRun(0):
+            self.assertFalse(job.kill())
+        self.assertFalse(process.killed)
+
+    def test_a_queued_job_has_no_process_but_is_still_cancelled(self) -> None:
+        job = server.Job(["vite", "dev"], ".", os.devnull)
+        self.assertFalse(job.kill())
+        self.assertEqual(job.status, "killed")
+
+    def test_a_kill_just_before_the_worker_claims_the_job_is_not_overwritten(
+        self,
+    ) -> None:
+        """The kill and the worker's claim share one critical section.
+
+        This was a real flake: `_run` marked the job running *after* checking for
+        a kill, so a kill landing in between was overwritten — the process ran
+        anyway, nothing terminated it, and its lane never moved again. The unit
+        that must not interleave is `begin_running` against `kill`.
+        """
+        job = server.Job(["vite", "dev"], ".", os.devnull)
+        self.assertFalse(job.kill())
+        self.assertFalse(job.begin_running(), "a killed job must not claim its lane")
+        self.assertEqual(job.status, "killed")
+
+    def test_the_claim_sets_the_clock_and_holds_otherwise(self) -> None:
+        job = server.Job(["vite", "build"], ".", os.devnull)
+        self.assertTrue(job.begin_running())
+        self.assertEqual(job.status, "running")
+        self.assertIsNotNone(job.started_at)
+        # A second claim is not the worker's business, and a kill still lands.
+        self.assertTrue(job.begin_running())
+        self.assertTrue(job.kill() is False or job.status == "killed")
+        self.assertEqual(job.status, "killed")
+
+
+class LongLaneDetectionTests(unittest.TestCase):
+    """Which commands are expected to run until they are killed."""
+
+    LONG: ClassVar[list[tuple[str, list[str]]]] = [
+        ("vite", []),
+        ("vite", ["dev"]),
+        ("vite", ["serve"]),
+        ("vite", ["preview"]),
+        ("vite", ["dev", "--port", "5199"]),
+        ("vitest", []),
+        ("vitest", ["--pool=threads"]),
+        ("vitest", ["watch"]),
+        ("pnpm", ["run", "dev"]),
+        ("pnpm", ["run", "start", "--", "--host"]),
+        ("pnpm", ["exec", "vite", "dev"]),
+        ("pnpm", ["exec", "vitest"]),
+    ]
+
+    SHORT: ClassVar[list[tuple[str, list[str]]]] = [
+        ("vite", ["build"]),
+        ("vite", ["--version"]),
+        ("vite", ["optimize"]),
+        ("vitest", ["run"]),
+        ("vitest", ["--run"]),
+        ("vitest", ["run", "--pool=threads"]),
+        ("vitest", ["--version"]),
+        ("pnpm", ["install"]),
+        ("pnpm", ["run", "build"]),
+        ("pnpm", ["run", "test"]),
+        ("pnpm", ["exec", "vitest", "run"]),
+        ("svelte-check", ["--tsconfig", "./tsconfig.json"]),
+        ("flutter", ["test"]),
+    ]
+
+    def test_long_shapes(self) -> None:
+        for cmd, args in self.LONG:
+            with self.subTest(cmd=cmd, args=args):
+                self.assertTrue(server.wants_long_lane(cmd, args))
+
+    def test_short_shapes(self) -> None:
+        for cmd, args in self.SHORT:
+            with self.subTest(cmd=cmd, args=args):
+                self.assertFalse(server.wants_long_lane(cmd, args))
+
+
+class LongLaneTests(unittest.TestCase):
+    """A job that never exits must not hold up the queue.
+
+    Real Node processes, because the thing being pinned is a scheduling
+    guarantee, not a shape: the queue lane has to finish a job while a server
+    sits on the long lane.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        build_fake_project(NODE_PROJECT)
+        NODE_LOG_SCRATCH.mkdir(parents=True, exist_ok=True)
+        cls.hub = server.ToolHub(cwd=str(NODE_PROJECT), log_dir=str(NODE_LOG_SCRATCH))
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.hub.stop()
+        remove_tree(NODE_PROJECT)
+        remove_tree(NODE_LOG_SCRATCH)
+
+    def tearDown(self) -> None:
+        """Leave no job running, so one failed assertion cannot cascade.
+
+        Without this a leaked dev server holds the long lane for every test that
+        follows, and a single failure reads as three unrelated ones.
+
+        Two conditions, not one: no job may be `queued`/`running` (the public
+        truth), **and** every lane must have finished its turn — `_current` is
+        cleared in the worker's `finally`, a moment after the status flips. That
+        second wait is what catches a job killed while its process was still being
+        spawned: its status is already `killed`, but the worker has not yet run
+        the guard that terminates the process, and the runner exiting at that
+        moment would leave the process behind.
+        """
+        for job in self.hub.list_jobs():
+            if job.status in ("queued", "running"):
+                job.kill()
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            busy = any(
+                job.status in ("queued", "running") for job in self.hub.list_jobs()
+            )
+            lanes_busy = any(
+                current is not None for current in self.hub._current.values()
+            )
+            if not busy and not lanes_busy:
+                return
+            time.sleep(0.1)
+        stuck = [
+            f"{job.id} {job.status} {job.argv}"
+            for job in self.hub.list_jobs()
+            if job.status in ("queued", "running")
+        ]
+        self.fail(f"the hub did not settle after tearDown: {stuck}")
+
+    def wait_for(self, job: Any, statuses: set[str], timeout: float = 30.0) -> str:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if job.status in statuses:
+                return str(job.status)
+            time.sleep(0.1)
+        return str(job.status)
+
+    def test_a_server_does_not_starve_the_queue(self) -> None:
+        running = self.hub.submit("vite", ["dev"])
+        self.assertTrue(running.long)
+        self.assertEqual(self.wait_for(running, {"running"}), "running")
+
+        queued = self.hub.submit("vite", ["preview"])
+        short = self.hub.submit("vitest", ["run"])
+
+        # The long lane does not count as "in the way" for a queued build...
+        self.assertEqual(self.hub.ahead_of(short.id), 0)
+        # ...while a second long job waits behind the running server.
+        self.assertEqual(self.hub.ahead_of(queued.id), 1)
+
+        self.assertEqual(self.wait_for(short, {"done", "failed"}), "done")
+        self.assertEqual(short.exit_code, 0)
+        # The fake suite prints a real vitest report, so the digest ran too.
+        self.assertEqual(short.summary, "2 passed")
+        self.assertEqual(short.counts, {"passed": 2, "skipped": 0, "failed": 0})
+        self.assertEqual(running.status, "running")
+        self.assertEqual(queued.status, "queued")
+
+        self.assertTrue(running.kill())
+        self.assertEqual(self.wait_for(running, {"killed"}), "killed")
+        self.assertEqual(self.wait_for(queued, {"running"}), "running")
+        self.assertTrue(queued.kill())
+
+    def kill_and_prove_the_lane_frees(self, job: Any) -> None:
+        """Kill a running job and prove its lane actually moved on.
+
+        `kill()`'s return value is deliberately **not** asserted: `False` means
+        "there was no process handle to kill", which is a legitimate answer in the
+        window between a job being marked running and its process existing — the
+        spawn guard is what stops it there. What must hold is the outcome, and the
+        only honest proof is the lane accepting the next job.
+        """
+        job.kill()
+        self.assertEqual(self.wait_for(job, {"done", "failed", "killed"}), "killed")
+        probe = self.hub.submit("vite", ["serve"])
+        self.assertEqual(self.wait_for(probe, {"running"}), "running")
+        probe.kill()
+
+    def test_an_explicit_flag_beats_the_guess(self) -> None:
+        forced_short = self.hub.submit("vitest", [], long=False)
+        self.assertFalse(forced_short.long)
+        self.assertEqual(self.wait_for(forced_short, {"done", "failed"}), "done")
+        forced_long = self.hub.submit("vitest", ["run"], long=True)
+        self.assertTrue(forced_long.long)
+        self.assertEqual(self.wait_for(forced_long, {"done", "failed"}), "done")
+
+    def test_killing_a_queued_job_keeps_it_from_starting(self) -> None:
+        """A queued job has no process, so its status is the whole decision."""
+        blocker = self.hub.submit("vite", ["dev"])
+        self.assertEqual(self.wait_for(blocker, {"running"}), "running")
+        queued = self.hub.submit("vite", ["preview"])
+        self.assertEqual(queued.status, "queued")
+
+        self.assertFalse(queued.kill())
+        self.assertEqual(queued.status, "killed")
+        # The probe this submits is the next job on the lane, so reaching
+        # "running" proves the killed job was skipped rather than started.
+        self.kill_and_prove_the_lane_frees(blocker)
+        self.assertEqual(queued.status, "killed")
+        self.assertIsNone(queued.resolved)
+        self.assertIsNotNone(queued.finished_at)
+
+    def test_a_kill_that_lands_during_the_spawn_still_stops_the_process(self) -> None:
+        """`kill()` before the handle exists must not leave a server behind.
+
+        The window is real, not theoretical: `_run_command` marks the job running,
+        resolves the launch and only then hands `Popen`'s result to `kill()`'s
+        reach. A kill inside it finds no process — and a dev server that outlives
+        the "killed" answer also holds this lane forever. `resolve_launch` is
+        where the kill is injected, because that is exactly the gap.
+        """
+        original = server.resolve_launch
+        holder: list[Any] = []
+
+        def racing(argv: list[str], *args: Any, **kwargs: Any) -> Any:
+            launch = original(argv, *args, **kwargs)
+            if holder:
+                holder.pop().kill()
+            return launch
+
+        # `setattr`, not `server.resolve_launch = ...`: the server is imported into
+        # this process as a module object, and only its attributes are typed.
+        setattr(server, "resolve_launch", racing)
+        try:
+            job = self.hub.submit("vite", ["dev"])
+            holder.append(job)
+            self.assertEqual(self.wait_for(job, {"killed"}), "killed")
+        finally:
+            setattr(server, "resolve_launch", original)
+
+        # The lane is what proves it: it only moves on once that process is gone,
+        # and a leftover one would also make the next long job wait forever.
+        probe = self.hub.submit("vite", ["serve"])
+        self.assertEqual(self.wait_for(probe, {"running"}), "running")
+        probe.kill()
+
+
+class LongFlagRouteTests(unittest.TestCase):
+    """`long` on `/run`: the flag, the guess, and the 400 for a non-boolean."""
+
+    TOKEN = "node-route-token"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        build_fake_project(NODE_PROJECT)
+        NODE_LOG_SCRATCH.mkdir(parents=True, exist_ok=True)
+        cls.hub = server.ToolHub(cwd=str(NODE_PROJECT), log_dir=str(NODE_LOG_SCRATCH))
+        cls.httpd = server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), server.make_handler(cls.hub, cls.TOKEN, "")
+        )
+        cls.httpd.daemon_threads = True
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.hub.stop()
+        remove_tree(NODE_PROJECT)
+        remove_tree(NODE_LOG_SCRATCH)
+
+    def test_a_dev_server_is_guessed_onto_the_long_lane(self) -> None:
+        status, job = http_call(
+            self.port, self.TOKEN, "POST", "/run", {"cmd": "vite", "args": ["dev"]}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(job["long"])
+        self.hub.get(job["id"]).kill()  # type: ignore[union-attr]
+
+    def test_the_flag_can_override_the_guess_either_way(self) -> None:
+        status, job = http_call(
+            self.port,
+            self.TOKEN,
+            "POST",
+            "/run",
+            {"cmd": "vitest", "args": [], "long": False},
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(job["long"])
+        status, job = http_call(
+            self.port,
+            self.TOKEN,
+            "POST",
+            "/run",
+            {"cmd": "vitest", "args": ["run"], "long": True, "wait": True},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(job["long"])
+
+    def test_a_non_boolean_long_is_a_400(self) -> None:
+        status, body = http_call(
+            self.port,
+            self.TOKEN,
+            "POST",
+            "/run",
+            {"cmd": "vite", "args": ["build"], "long": "yes"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("long", body["error"])
+
+    def test_health_reports_the_command_surface(self) -> None:
+        status, body = http_call(self.port, self.TOKEN, "GET", "/health")
+        self.assertEqual(status, 200)
+        for name in ("flutter", "dart", "git", "pnpm", "vite", "vitest"):
+            self.assertIn(name, body["commands"])
+
+
+class DeployPayloadTests(unittest.TestCase):
+    """`sync_to_skills` deploys an allow list, not "everything minus a list".
+
+    This guard was written because it had already failed: the deployer used to
+    copy the whole repository minus a few names, which shipped `.gitignore`,
+    `LICENSE`, `ruff.toml`, `.github/` and `__pycache__/*.pyc` into the skill —
+    and would have shipped a scratch tree sitting in the repository, at whatever
+    size it happened to have.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        path = ROOT / "scripts" / "sync_to_skills.py"
+        spec = importlib.util.spec_from_file_location("sync_to_skills", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["sync_to_skills"] = module
+        spec.loader.exec_module(module)
+        cls.deploy = module
+
+    def payload(self, root: pathlib.Path) -> set[str]:
+        """The deployer's payload, with separators normalised for comparison."""
+        return {rel.replace("\\", "/") for rel in self.deploy.project_files(str(root))}
+
+    def make_repo(self, name: str) -> pathlib.Path:
+        root = NODE_SCRATCH / name
+        shutil.rmtree(root, ignore_errors=True)
+        (root / "scripts").mkdir(parents=True)
+        (root / "SKILL.md").write_text(
+            "---\nname: fake-skill\n---\n\nbody\n", encoding="utf-8"
+        )
+        (root / "scripts" / "toolhub_server.py").write_text(
+            "# server\n", encoding="utf-8"
+        )
+        (root / "scripts" / "arb_edit_lib.py").write_text("# lib\n", encoding="utf-8")
+        return root
+
+    def tearDown(self) -> None:
+        shutil.rmtree(NODE_SCRATCH, ignore_errors=True)
+
+    def test_the_payload_is_skill_md_plus_scripts(self) -> None:
+        root = self.make_repo("payload")
+        self.assertEqual(
+            self.payload(root),
+            {"SKILL.md", "scripts/toolhub_server.py", "scripts/arb_edit_lib.py"},
+        )
+
+    def test_repository_plumbing_is_not_deployed(self) -> None:
+        root = self.make_repo("plumbing")
+        for name in (".gitignore", "LICENSE", "README.md", "CONTEXT.md", "ruff.toml"):
+            (root / name).write_text("x\n", encoding="utf-8")
+        (root / ".github" / "workflows").mkdir(parents=True)
+        (root / ".github" / "workflows" / "ci.yml").write_text(
+            "on: push\n", encoding="utf-8"
+        )
+        (root / "docs" / "adr").mkdir(parents=True)
+        (root / "docs" / "adr" / "0001.md").write_text("decision\n", encoding="utf-8")
+        files = self.payload(root)
+        for leaked in (
+            ".gitignore",
+            "LICENSE",
+            "README.md",
+            "CONTEXT.md",
+            "ruff.toml",
+            ".github/workflows/ci.yml",
+            "docs/adr/0001.md",
+        ):
+            self.assertNotIn(leaked, files)
+
+    def test_a_stray_tree_of_any_kind_is_not_deployed(self) -> None:
+        """The failure that motivated the allow list: scratch that nobody excluded."""
+        root = self.make_repo("stray")
+        scratch = root / ".sandbox-probe" / "app" / "node_modules" / "vite"
+        scratch.mkdir(parents=True)
+        (scratch / "package.json").write_text("{}\n", encoding="utf-8")
+        (root / ".pnpm-store").mkdir()
+        (root / ".pnpm-store" / "blob").write_text("x\n", encoding="utf-8")
+        self.assertEqual(
+            self.payload(root),
+            {"SKILL.md", "scripts/toolhub_server.py", "scripts/arb_edit_lib.py"},
+        )
+
+    def test_compiled_artefacts_are_skipped_inside_the_payload(self) -> None:
+        root = self.make_repo("compiled")
+        cache = root / "scripts" / "__pycache__"
+        cache.mkdir()
+        (cache / "toolhub_server.cpython-314.pyc").write_bytes(b"\x00")
+        (root / "scripts" / "stale.pyc").write_bytes(b"\x00")
+        self.assertEqual(
+            self.payload(root),
+            {"SKILL.md", "scripts/toolhub_server.py", "scripts/arb_edit_lib.py"},
+        )
+
+    def test_the_skill_name_comes_from_the_frontmatter(self) -> None:
+        """The repo is `dsh-tool-bridge`; the skill it deploys is `tool-bridge`."""
+        self.assertEqual(self.deploy.skill_name(str(ROOT)), "tool-bridge")
+
+    def test_a_deploy_prunes_what_the_payload_no_longer_has(self) -> None:
+        self.make_repo("prune")
+        dest = NODE_SCRATCH / "prune-dest"
+        dest.mkdir()
+        # What a previous deny-list deployment left behind, plus a stale payload
+        # file: `main()` deploys *this* repository, so anything else here is a
+        # leftover that the prune has to take away.
+        (dest / "LICENSE").write_text("old\n", encoding="utf-8")
+        (dest / ".github" / "workflows").mkdir(parents=True)
+        (dest / ".github" / "workflows" / "ci.yml").write_text(
+            "old\n", encoding="utf-8"
+        )
+        (dest / "scripts" / "__pycache__").mkdir(parents=True)
+        (dest / "scripts" / "__pycache__" / "x.pyc").write_bytes(b"\x00")
+        (dest / "scripts" / "retired_helper.py").write_text("old\n", encoding="utf-8")
+        argv = sys.argv
+        sys.argv = ["sync_to_skills.py", "--dest", str(dest)]
+        try:
+            self.assertEqual(self.deploy.main(), 0)
+        finally:
+            sys.argv = argv
+        left = sorted(
+            str(path.relative_to(dest)).replace("\\", "/")
+            for path in dest.rglob("*")
+            if path.is_file()
+        )
+        # The destination is exactly the payload — no more, no less.
+        self.assertEqual(left, sorted(self.payload(ROOT)))
+        self.assertNotIn("scripts/retired_helper.py", left)
+        # Emptying a directory must not leave the directory itself behind.
+        self.assertFalse((dest / ".github").exists())
+        self.assertFalse((dest / "scripts" / "__pycache__").exists())
 
 
 if __name__ == "__main__":

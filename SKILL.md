@@ -1,6 +1,6 @@
 ---
 name: tool-bridge
-description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build), a Node toolchain command (pnpm install/run, vite build or dev, vitest, svelte-check, tsc), a git write (add, commit, restore), or a Flutter ARB localization edit is needed. Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command.
+description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build), a Node toolchain command (pnpm install/run, vite build or dev, vitest, svelte-check, tsc), a git write (add, commit, restore), or a Flutter ARB localization edit is needed — or when the model should really look at and click a running UI (a UI walkthrough, section 7). Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command; the browser itself is NOT this server (ADR-0005).
 ---
 
 <what-to-do>
@@ -313,7 +313,125 @@ Invoke-RestMethod "http://127.0.0.1:$port/jobs/$($r.id)/kill" -Method Post -Head
   bridge falls back to terminating the process it spawned, and logs
   `TOOLHUB KILL` when it does.
 
-## 7. Stop it
+## 7. Look at the UI and click it (UI walkthrough)
+
+A walkthrough is how the model finds the entry point no user can reach and the
+screen that is merely ugly — things no assertion returns false for. It splits
+along a line worth internalising: **this server runs the App under test, the
+browser drives it** (ADR-0005). The browser is `@playwright/mcp`, reached as
+native tools named `mcp__ui__browser_*` through `@deepseek-ai/dsh-mcp-client`;
+it is **not** a bridge job, route or sub-tool, and no request here can reach it.
+
+### One-time setup (once per machine, never per launch)
+
+```powershell
+# Pin the package at the harness's OWN version (`dsh --version`), not the
+# registry default — see the trap below.
+dsh plugin --profile web add '@deepseek-ai/dsh-mcp-client@0.1.5-rc.2'
+```
+
+Then append the insert list in the repository's
+`docs/browser-mcp.profile-row.yml` to
+`%USERPROFILE%\.dsh\profiles\web\cordis.patch.yml`, and restart the harness
+once. From then on every session of that profile carries the browser tools.
+
+- **Always pin the version to the harness's own.** The registry's default tag
+  for `@deepseek-ai/dsh-mcp-client` is **`0.0.1-rc.1`**, a much older line: its
+  peers (`@deepseek-ai/dsh-tools ^0.0.1-rc.1`) do not match a 0.1.x harness, and
+  it carries **no image-admission code at all**. A bare `dsh plugin add
+  @deepseek-ai/dsh-mcp-client` installs exactly that, silently. Check the
+  installed version afterwards:
+  `(Get-Content "$env:USERPROFILE\.dsh\profiles\web\node_modules\@deepseek-ai\dsh-mcp-client\package.json" -Raw | ConvertFrom-Json).version`
+  must equal `dsh --version`.
+- **The install alone loads nothing.** `dsh-mcp-client` declares no
+  `dsh.bundle`, so `plugin add` installs the package and prints a warning; the
+  patch row is what loads it. With no row there is no server and no cost.
+- **The row must be an insert list.** A patch entry naming an id no bundle row
+  owns is *skipped with a warning*, so a plain `- id:` row silently does
+  nothing. Check the composition without booting:
+  `dsh --profile web --dump-config` (it writes `cordis.yml` into the profile
+  directory, so run it where that write is permitted). The row is composed when
+  `mcp-ui` appears in the dump **as a tree entry**, not only under the
+  `# == ...cordis.patch.yml` source header.
+- **What is resident is the tool schemas**, on every request of every session
+  of that profile — the accepted price of not changing how sessions are
+  launched. Measured with `--caps=vision,devtools`: **44 tools**. Drop a
+  capability to shrink it; `core` (~25) always stays. No browser process exists
+  until a tool is called.
+
+### The loop
+
+```powershell
+# 1. The app under test: started by the bridge, because starting it needs the
+#    boot escalation. Measured: vite's `net use` probe runs INSIDE the vite
+#    process, so `vite dev` dies in the sandbox even when the bridge itself was
+#    started elevated — the elevation is load-bearing, not a nicety.
+python -u <skill>\scripts\toolhub_server.py --cwd "D:\Projects\pinch-pic" --watch-parent
+```
+
+```powershell
+# 2. A long job for the dev server, then read the port it bound from the log
+$body=@{cmd='vite';args=@('dev');long=$true;wait=$true;timeoutSec=60}|ConvertTo-Json -Compress
+$r = Invoke-RestMethod "http://127.0.0.1:$port/run" -Method Post -Headers $h -Body $body -TimeoutSec 90
+$r.status      # "running" — correct for a dev server, not a hang
+$r.tail        # "... Local:   http://localhost:5199/"
+```
+
+3. **Navigate, then look**: `mcp__ui__browser_navigate` to that URL, then
+   `browser_snapshot` — the accessibility tree as *text*, cheap, and the source
+   of the element refs you act on — and `browser_take_screenshot`. Sight arrives
+   either way: as an image block in the tool result, or as the file it writes,
+   which you read with the harness's image tool.
+4. **Act by ref**: `browser_click`, `browser_type`, `browser_select_option`,
+   `browser_press_key`, `browser_wait_for`, and `browser_file_upload` (an
+   image tool needs a real file: create it inside the workspace first). Reach
+   for the coordinate tools (`browser_mouse_click_xy`, **vision** capability)
+   only for pixels with no DOM node — a canvas.
+5. **When the screen is blank, read the console, not the widget tree**:
+   `browser_console_messages` and `browser_network_requests` are where a
+   failed asset, a CORS error, or a hydration crash actually says so.
+6. **Record when one still is not enough**: `browser_start_video` /
+   `browser_stop_video` (**devtools** capability) write a `.webm` into the
+   row's `--output-dir`.
+7. **Deliver**: screenshots are already in the conversation for you; for the
+   video, copy the file from the output directory into the session workspace
+   (writes inside it are permitted) and hand it over with the presentation
+   tool. The output directory is outside every workspace on purpose.
+8. **Make the finding repeatable** — write it as a script-driven E2E run and
+   run that through `/run` (section 2). A walkthrough produces artifacts and
+   findings; only a test run produces a **Digest** with counts and a failure
+   inventory that CI repeats.
+
+### Sight, two ways
+
+A screenshot is sight whichever way it reaches you: an image block in the tool
+result, or the file it wrote, read with the harness's image tool. The second is
+not a degraded mode — the harness could already read a local image before any
+of this existed — so use whichever is at hand and do not treat the file path as
+a lesser observation.
+
+What is not allowed is the claim: **never report having seen a page you only
+have a path to.** If an image result comes back as a short diagnostic text
+block (the model declares no image input, or the attachment feature is off),
+read the file instead — and if you cannot read it either, say so rather than
+describing what you assume is on the screen.
+
+### Flutter: what is true today
+
+- **Script-driven integration tests already work through `/run`** — no new
+  machinery, no bridge change: `flutter test integration_test -d windows` is an
+  ordinary job (`kelivo` and `cuplivo` already carry `integration_test/`). This
+  is the repeatable half for Flutter.
+- **A Flutter web build can be driven like any page**, with one caveat: it
+  renders to a canvas, so the DOM snapshot is nearly empty and the pointer is
+  coordinates (**vision**). Build it, serve it as a long job, drive it.
+- **Desktop live driving is not available**, and the honest reason is input
+  injection: `flutter_driver` is superseded by `integration_test`, and outside
+  the test bindings the Dart VM service offers a screenshot extension but no
+  way to send a tap (ADR-0005). Do not promise a desktop Flutter app that the
+  model can click.
+
+## 8. Stop it
 
 `POST /stop` when work is done (`Invoke-RestMethod ".../stop" -Method Post
 -Headers $h`). If it is left running, the parent watchdog ends it when the
@@ -799,6 +917,19 @@ is still a fresh process. The wins are friction, correctness and observability.
   that scratch repository up afterwards needs git's read-only loose objects made
   writable first (`os.chmod(path, stat.S_IWRITE)` before unlinking); a plain
   `rmtree` fails with `PermissionError: [WinError 5]`.
+- **`mcp__ui__browser_*` tools are missing** → the profile has no patch row,
+  the row is the wrong shape (an insert list is required; a plain `- id:` row is
+  skipped with a warning), or the harness has not been restarted since the row
+  was added. Check the composition with `dsh --profile web --dump-config`.
+- **A screenshot arrives as one sentence instead of an image** → the image block
+  was not admitted (no image input on the model, or the attachment feature off).
+  Read the file from the row's `--output-dir` with the image-reading tool: that
+  is the ordinary second way sight arrives, not a fallback. Never report UI
+  findings from a path you have not looked at.
+- **The browser tools work but the page is unreachable** → the dev server is a
+  **Long job**: confirm it is still `running` in `GET /jobs`, then take the URL
+  from its tail. Vite picks the next free port when 5173 is taken, so never
+  assume the default.
 
 ## Non-goals (deliberate)
 
@@ -812,10 +943,13 @@ pin is boot-scoped, like the cwd) and a scope for any command but `dart format`,
 analyze`/`fix` and `flutter analyze`/`fix`, copying build caches between
 worktrees (CMake/ninja
 state is path-keyed, so copying forces a full reconfigure while the genuinely
-expensive caches — pub cache, SDK artifacts — are already machine-global), and a
+expensive caches — pub cache, SDK artifacts — are already machine-global), a
 queue-aware early return from `/run` (`wait:false` already expresses it, and
 returning `queued` whenever the queue is non-empty would force polling for the
-common case).
+common case), and UI driving *inside* this server: the browser belongs to
+`@playwright/mcp` through the MCP client (ADR-0005), because a browser session is
+not a **Job**, has no **Digest**, and needs no lane — the bridge runs the app
+under test, the browser drives it (section 7).
 
 ## Deploying changes to this skill
 

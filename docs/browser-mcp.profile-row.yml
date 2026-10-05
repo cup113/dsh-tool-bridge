@@ -1,0 +1,79 @@
+# The profile row that gives the model a browser (ADR-0005, SKILL.md section 7).
+#
+# How this file is used — once per machine, never per launch:
+#
+#   1. Install the bridge plugin into the profile that runs your sessions,
+#      pinned to the harness's own version (`dsh --version`):
+#
+#        dsh plugin --profile web add '@deepseek-ai/dsh-mcp-client@0.1.5-rc.2'
+#
+#      Pin it: the registry's default tag for this package is 0.0.1-rc.1, an
+#      older line whose peers (@deepseek-ai/dsh-tools ^0.0.1-rc.1) do not match
+#      a 0.1.x harness and which has no image-admission code at all — and a bare
+#      `dsh plugin add @deepseek-ai/dsh-mcp-client` installs exactly that.
+#
+#      The install *only* installs the package. `dsh-mcp-client` declares no
+#      `dsh.bundle`, so it adds no bundle layer and prints a warning; with no row
+#      it loads nothing, spawns no server and costs no tokens.
+#
+#   2. Append the entry below to the profile's own patch layer
+#      (`%USERPROFILE%\.dsh\profiles\web\cordis.patch.yml`, an empty `[]` until
+#      you touch it). The insert list is what actually loads the plugin: a
+#      patch entry that names an id no bundle row owns is skipped with a
+#      warning, so a plain `- id:` form here would silently do nothing.
+#
+#   3. Restart the harness once. From then on every session of that profile
+#      carries `mcp__ui__browser_*`. Verify the composition without booting:
+#
+#        dsh --profile web --dump-config
+#
+#      (`--dump-config` writes `cordis.yml` into the profile directory, so run
+#      it where that write is permitted.) The row has composed when `mcp-ui`
+#      appears in the dump as a tree entry, not only under the
+#      `# == ...cordis.patch.yml` source header.
+#
+# Why these flags:
+#
+#   --browser=msedge        drive the Edge that Windows already ships; no
+#                           `playwright install` download, no browser cache.
+#                           Verified: the channel launches with no download.
+#   --caps=vision,devtools  `vision` adds the coordinate mouse tools (the only
+#                           pointer Flutter-web/canvas rendering can be driven
+#                           with); `devtools` adds the video/trace recorders
+#                           whose files land in the output directory below.
+#                           Drop a capability to shrink the resident tool
+#                           schemas (measured: 44 with both, ~25 for core
+#                           alone); `core` always stays.
+#   --output-dir=...        where video, trace and PDF files are written. It is
+#                           outside any session workspace on purpose: the model
+#                           copies an artifact into the workspace before
+#                           presenting it (SKILL.md section 7).
+#
+# `@playwright/mcp@latest` currently resolves to an alpha build (1.64.0-alpha…),
+# verified working on 2026-09-23 against Edge. Replace `@latest` with a pinned
+# version if an alpha ever regresses — the flag set above is the contract, not
+# the version.
+#
+# The browser is a normal user process spawned by the harness — it holds none
+# of the Bridge's boot elevation, and no request in the tool-bridge surface can
+# reach it.
+#
+# `serverName: ui` fixes the model-facing tool names: `mcp__ui__browser_click`,
+# `mcp__ui__browser_take_screenshot`, ... Renaming it renames every tool.
+
+- insert:
+    - id: mcp-ui
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: ui
+        transport: stdio
+        command: npx
+        args:
+          - '-y'
+          - '@playwright/mcp@latest'
+          - '--browser=msedge'
+          - '--caps=vision,devtools'
+          - '--output-dir=C:/Users/jason/AppData/Local/dsh-pw-mcp'
+        # A screenshot or a stopped video can take longer than the 60 s
+        # default; the model can also raise this per call only by editing here.
+        toolCallTimeoutMs: 120000

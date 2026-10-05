@@ -168,14 +168,18 @@ registry that cannot be read claims nothing and says so.
 ## Where the rest lives
 
 - `SKILL.md` — the agent-facing reference: start, drive, timeouts, the ARB
-  sub-tool, the test digest and the known-failure registry.
+  sub-tool, the test digest, the known-failure registry, and the **UI
+  walkthrough** loop (section 7).
 - `CONTEXT.md` — the vocabulary the code and the skill are written in (bridge,
-  escalation, guardrail, digest, format pin, uncommitted scope), plus the
-  ambiguities that were resolved to get there.
+  escalation, guardrail, digest, format pin, uncommitted scope, UI walkthrough),
+  plus the ambiguities that were resolved to get there.
 - `docs/adr/` — the decisions that are expensive to reverse: the allowlist is a
   guardrail rather than a privilege boundary; the working directory is pinned, so
   there is no per-job `cwd` or baseline worktree; sub-tools are queue jobs with
-  structured results.
+  structured results; and the bridge drives the toolchain, not the UI.
+- `docs/browser-mcp.profile-row.yml` — the profile row that gives a session real
+  eyes and hands (`@playwright/mcp` over system Edge, via
+  `@deepseek-ai/dsh-mcp-client`), with the setup it belongs to.
 - `docs/vite-vitest-sandbox-findings.md` — the measurements behind the Node
   surface: which commands the sandbox kills, with what error, and why Vite 7
   cannot be rescued the way Vite 8 can.
@@ -212,6 +216,13 @@ why it ships as a skill plus a script rather than as a plugin package.
   `git restore .`), `stash`, and `checkout`/`switch` in every form.
 - An accepted executable name for arbitrary commands — see the security model
   above; `dart` already reaches arbitrary code.
+- UI driving in the bridge: the browser belongs to `@playwright/mcp` through
+  `@deepseek-ai/dsh-mcp-client`, not to this server (ADR-0005). The bridge runs
+  the app under test; the browser drives it. The reason is the maintained tool
+  surface — an accessibility snapshot with element refs, auto-waiting, uploads,
+  dialogs, console, network and video — not the pictures: the harness already
+  reads a local screenshot, so a path is sight too. `SKILL.md` section 7 is the
+  loop.
 - Per-job `cwd` and worktree-per-baseline entries (ADR-0002), detached mode across
   sessions, and build-cache copying between worktrees (CMake/ninja state is
   path-keyed, while the genuinely expensive caches — pub cache, SDK artifacts —

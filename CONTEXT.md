@@ -138,6 +138,60 @@ _Avoid_: history-rewriting (too narrow — `restore .` rewrites no history and i
 A commit message passed as the `/run` field `message`, which the bridge folds into argv as `-m <text>`. No file is ever created for it.
 _Avoid_: commit body, message file, `-F` file
 
+### UI walkthrough
+
+**UI walkthrough**:
+The model exercising a live UI with the browser tools — navigate, snapshot,
+click, type, screenshot, watch — while the **Bridge** runs the **App under
+test**, and reporting what it saw as artifacts. It is the exploratory half of
+UI testing; the repeatable half is a script-driven E2E run, which is an
+ordinary **Job**.
+_Avoid_: E2E test (that is the script-driven run), browser automation, UI test
+
+**App under test**:
+The running application a **UI walkthrough** drives — normally a **Long job**
+(`vite dev`, `vite preview`) on the **Bridge**, in the **Pinned cwd**. Its
+lifecycle is the Bridge's, because starting it is what needs the boot
+**Escalation** (Vite's `net use` probe dies inside the file sandbox).
+_Avoid_: target app, SUT, dev server (that names the command, not the role)
+
+**Driving**:
+The other half of a **UI walkthrough**: navigate, snapshot, click, type,
+screenshot, record. It belongs to the browser MCP server, which is outside the
+Bridge entirely — so it is not a **Job**, not a **Lane**, and has no log, no
+**Digest** and no status-page row.
+_Avoid_: browser job, browser session (the Bridge holds neither)
+
+**Browser tool**:
+One of the model-facing tools the browser MCP server publishes
+(`mcp__ui__browser_click`, `mcp__ui__browser_take_screenshot`, …). A screenshot
+arrives as an image block in the tool result, and the same file read with the
+harness's image tool is the other half of **Sight**.
+_Avoid_: browser command, browser endpoint, tool call (too broad)
+
+**Sight**:
+How a **UI walkthrough** observes the page, in two interchangeable channels: the
+image block a screenshot **Browser tool** returns, and the same screenshot file
+read with the harness's image tool. Neither is privileged — the harness could
+already read a local image, so image transport is a convenience (one tool call
+instead of a file plus a read), never the reason for the split. What is not
+optional is that a walkthrough must not report having seen a page it only has a
+path to.
+_Avoid_: vision, sight fallback, screenshot workaround
+
+**Resident row**:
+The profile patch entry that loads the browser MCP server into every session of
+a profile — the accepted shape (ADR-0005), as opposed to a per-launch overlay.
+What is resident is the *tool schemas*, which every request pays for; no browser
+process exists until a **Browser tool** opens one.
+_Avoid_: always-on plugin, permanent MCP, daemon
+
+**Artifact copy-back**:
+Moving a browser artifact — video, trace, PDF — from the row's fixed output
+directory into the session workspace, so it can be handed to the human
+(`present`). The output directory is outside every workspace on purpose.
+_Avoid_: download, export, attachment
+
 ### Investigation
 
 **Baseline attribution**:
@@ -174,6 +228,12 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 - A **Tail** and an optional **Log filter** shape a response, not a job: the raw log is never rewritten.
 - The **Allowlist** is a **Guardrail**; it is not a privilege boundary, because `dart` reaches arbitrary code.
 
+- A **UI walkthrough** drives an **App under test**: **Running** it is the Bridge's (a **Long job** in the **Pinned cwd**), **Driving** it is the browser MCP's, and the split is ADR-0005.
+- A **Browser tool** costs no **Escalation** and creates no **Job**: the browser MCP is spawned by the harness, holds none of the boot approval, and appears in no **Lane**.
+- A **UI walkthrough** produces artifacts, not a **Digest**; its finding becomes repeatable by being written as a script-driven E2E run through `/run`.
+- A screenshot reaches the model through either half of **Sight**; the second half is not a degraded path but an ordinary one, and only the claim to have seen a page may not rest on a path.
+- A **Resident row** is composed at boot; no request in the bridge surface can load, retarget or disable it.
+
 ## Example dialogue
 
 > **Dev:** "The feedback calls `git restore` the last escalation hole. So allowing it closes a privilege leak?"
@@ -194,6 +254,12 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 > **Maintainer:** "That fallback is the problem, not the feature — measured, `pnpm exec cmd /c echo hi` works. `exec` takes a **Script binary** name and nothing else; anything else is a 403 naming `pnpm run`."
 > **Dev:** "And `pnpm run test` — does that get the known-failure split?"
 > **Maintainer:** "Yes, and that is why a **Digest** has a **Flavor** read from the log: the argv `pnpm run test` says nothing about vitest, but the reporter's own markers do."
+> **Dev:** "The walkthrough found a button no user can reach. So the browser becomes a **Job** on the **Queue**, and I drive it from there?"
+> **Maintainer:** "No — a browser is not a **Job**. It has no log, no **Digest** and no **Lane**, and the Bridge never holds UI state (ADR-0005). The Bridge runs the **App under test**; the browser MCP does the **Driving**, as **Browser tools**, and your finding becomes repeatable by being written as a script-driven run through `/run`."
+> **Dev:** "Then the same for a Flutter app?"
+> **Maintainer:** "You can *look* at a Flutter web build and click it by coordinates — a canvas has no DOM to snapshot. On the desktop there is nothing to inject input with outside the test bindings, so that half stays `integration_test` through `/run`, which was never blocked."
+> **Dev:** "And when the screenshot does not come back as an image?"
+> **Maintainer:** "Then read the file yourself — that is the other half of **Sight**, not a lesser one. The harness could already read a local image, which is exactly why the split is argued on the tool surface and not on pictures. The one rule is the claim: a walkthrough never reports having seen a page it only has a path to."
 
 ## Flagged ambiguities
 
@@ -212,3 +278,7 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 - "`pnpm exec` is safe because pnpm only runs installed packages" — measured false: `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both work, because pnpm falls back to `PATH`. That is why the **`pnpm` surface** narrows `exec` to a **Script binary** and refuses `-c/--shell-mode`.
 - "the sandbox denies `vite` because of a file" — resolved: the sandbox denies **pipes**. `spawn`/`exec`/`fork` with piped stdio throw `EPERM` (no named pipes), while `inherit`, a file fd, `worker_threads` and loopback TCP all work; that single mechanism explains Vite's `net use` probe, vitest's default forks pool and esbuild's service spawn (ADR-0004).
 - "killing a job is just `taskkill`" — resolved: it is not, under this sandbox. `taskkill /F /T` answers "access denied" while the target is alive, so the fallback to the owned process handle is part of the **Long job** feature rather than a detail: without it a killed dev server kept running *and* held its lane.
+- "让模型操纵浏览器进行测试" / "let the model test the UI" — resolved: two different capabilities. A **UI walkthrough** is exploratory live driving, and that is the one that was missing; a script-driven E2E run is a **Job** that already works through `/run` (`pnpm run <e2e script>`, `flutter test integration_test -d windows`). Only the first needed building (ADR-0005).
+- "the browser runs in the bridge" — resolved: false by construction. The browser is a normal user process spawned by the harness, holding none of the Bridge's boot **Escalation**; the **Allowlist** — a **Guardrail**, not a boundary — does not reach it, and nothing in the bridge surface can retarget it.
+- "an always-on MCP server" — resolved: what is permanent is the **Resident row** and therefore the *tool schemas*, not a browser. No server process is spawned until a **Browser tool** is called, and the accepted cost is tool definitions on every request of every session of that profile (ADR-0005).
+- "the walkthrough proves the UI works" — resolved: it does not, by itself. A **UI walkthrough** is exploratory and produces artifacts and findings; only a script-driven E2E run produces a **Digest** with **Counts** and a **Failure inventory** that CI can repeat.

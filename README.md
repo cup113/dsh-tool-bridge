@@ -4,8 +4,10 @@
 
 A session-scoped, loopback-only toolchain server for **file-sandboxed agent
 sessions**. It is started once with one elevated approval and then runs
-`flutter`/`dart` (any subcommand), a Node toolchain — `pnpm` and the project's own
-`vite`/`vitest`/`svelte-check`/`svelte-kit`/`tsc` — a guard-railed `git` verb set
+`flutter`/`dart` (any subcommand), a Node toolchain — a package manager
+(`pnpm`, or `npm` for a fork whose upstream uses it, plus the narrowed `npx`)
+and the project's own `vite`/`vitest`/`svelte-check`/`svelte-kit`/`tsc` — a
+guard-railed `git` verb set
 and a couple of sub-tools on the agent's behalf over HTTP, so the confined agent
 pays **one approval per session instead of one per command**.
 
@@ -39,11 +41,16 @@ whole lifetime, the access your boot approval granted.
   code with that access. What the allowlist buys is *recovery cost and surprise*
   for a fallible caller — a refused command is one you cannot lose work to — not
   privilege (ADR-0001).
-- `pnpm install` runs the project's dependency build scripts, and `pnpm run`
-  runs whatever a `package.json` says, with the same access. `pnpm exec` is
-  accepted only for the project's own script binaries, because it also runs
-  anything it finds on `PATH` (measured); `pnpm dlx` and `pnpm publish` are
-  absent by omission.
+- `pnpm install`/`npm install` run the project's dependency build scripts, and
+  `pnpm run`/`npm run` runs whatever a `package.json` says, with the same access.
+  The exec forms — `pnpm exec`, `npm exec`, `npx` — are accepted only for the
+  project's own script binaries, because they also run anything they find on
+  `PATH` (measured), and `npx` will fetch what it cannot find. `pnpm dlx`,
+  `npm link`, `publish`/`config`, `npx --package` and `pnpm store` are absent by
+  omission.
+- Whichever manager you name may write the *other's* lockfile — the lockfile is
+  advisory here, and no request is refused for the project using the other one
+  (ADR-0006). `npm ci` is the strict install that cannot rewrite the lockfile.
 - It binds `127.0.0.1` on an ephemeral port, and every route but `/health`
   requires a bearer token. The token is never written to a file by the bridge: it
   is printed to the job output that started it, and — when the status page opens
@@ -60,8 +67,9 @@ whole lifetime, the access your boot approval granted.
 - **Windows** — CI-verified. The code carries a POSIX fallback that nobody has
   exercised, so treat elsewhere as untested rather than supported.
 - **Python 3.11+** for the server: standard library only, no dependencies.
-- `flutter`/`dart`, `git`, and `node`/`pnpm` on `PATH` for the jobs that use
-  them. A script binary is looked for in the pinned cwd's `node_modules`.
+- `flutter`/`dart`, `git`, and `node` plus whichever package manager you name
+  (`pnpm`, `npm`, `npx`) on `PATH` for the jobs that use them. A script binary is
+  looked for in the pinned cwd's `node_modules`.
 
 ## Install
 
@@ -124,10 +132,14 @@ call look like a 404, caller-timeout nesting, and what every digest field means.
 
 **Run the project's own Node tools, and keep the dev server out of the queue.**
 `{"cmd":"vite","args":["build"]}` and `{"cmd":"vitest","args":["run"]}` are
-accepted directly, and `pnpm` covers `install`/`add`/`run`/`exec`/`why`/… — a
-script binary is resolved out of the pinned cwd's `node_modules` by reading its
-package's `bin` field, so no `.cmd` wrapper drags `cmd.exe` into an argv that is
-supposed to have no shell. A command that is expected to run until it is killed
+accepted directly, and a package manager — `pnpm`, or `npm` for a fork whose
+upstream uses it, with `npx` accepted as its exec form — covers
+`install`/`ci`/`add`/`run`/`exec`/`why`/… A script binary is resolved out of the
+pinned cwd's `node_modules` by reading its package's `bin` field, so no `.cmd`
+wrapper drags `cmd.exe` into an argv that is supposed to have no shell. npm's
+bare-script shorthands (`npm test`, `npm start`) are normalised to
+`npm run test`/`npm run start`, so they are not a second surface. A command that
+is expected to run until it is killed
 (`vite dev`, `vite preview`, `vitest` in watch mode, a conventional
 `dev`/`start`/`serve`/`watch` script) runs on its **own lane** instead of the
 queue: `"long": true` says so explicitly, and the bridge otherwise guesses — the
@@ -176,7 +188,8 @@ registry that cannot be read claims nothing and says so.
 - `docs/adr/` — the decisions that are expensive to reverse: the allowlist is a
   guardrail rather than a privilege boundary; the working directory is pinned, so
   there is no per-job `cwd` or baseline worktree; sub-tools are queue jobs with
-  structured results; and the bridge drives the toolchain, not the UI.
+  structured results; npm is a package manager here on the same terms as pnpm
+  (ADR-0006); and the bridge drives the toolchain, not the UI.
 - `docs/browser-mcp.profile-row.yml` — the profile row that gives a session real
   eyes and hands (`@playwright/mcp` over system Edge, via
   `@deepseek-ai/dsh-mcp-client`), with the setup it belongs to.
@@ -192,7 +205,7 @@ registry that cannot be read claims nothing and says so.
 
 ```powershell
 python -m pip install -r requirements-dev.txt
-python tests/test_toolhub.py        # 144 tests, standard-library unittest
+python tests/test_toolhub.py        # 171 tests, standard-library unittest
 ruff check . ; ruff format --check .
 pyright scripts tests
 ```
@@ -216,6 +229,13 @@ why it ships as a skill plus a script rather than as a plugin package.
   `git restore .`), `stash`, and `checkout`/`switch` in every form.
 - An accepted executable name for arbitrary commands — see the security model
   above; `dart` already reaches arbitrary code.
+- The unnarrowed package-manager forms: `pnpm dlx`, `npm link`/`unlink`,
+  `publish`, `config`/`store`, and an **Exec form** target that is not one of the
+  project's own script binaries (`npx <anything>` included). `npx` itself is
+  accepted, but only in that narrowed shape (ADR-0006).
+- Guessing a project's package manager from its lockfile: the lockfile is
+  advisory, the caller names the manager, and a fork carrying both lockfiles is
+  the case that motivated admitting npm at all (ADR-0006).
 - UI driving in the bridge: the browser belongs to `@playwright/mcp` through
   `@deepseek-ai/dsh-mcp-client`, not to this server (ADR-0005). The bridge runs
   the app under test; the browser drives it. The reason is the maintained tool

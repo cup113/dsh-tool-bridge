@@ -1,6 +1,8 @@
 # The Node toolchain is a named surface, and long jobs get their own lane
 
-**Status**: accepted
+**Status**: accepted (the package-manager half of this surface was widened by
+[ADR-0006](./0006-npm-on-the-same-terms-as-pnpm.md), which admits `npm` and
+`npx` on the same terms; every measurement recorded below still holds)
 
 Two separate problems turned up together when the bridge grew a Vite/Svelte
 surface, and they are recorded together because the second is only visible

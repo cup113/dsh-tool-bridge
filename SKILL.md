@@ -1,6 +1,6 @@
 ---
 name: tool-bridge
-description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build), a Node toolchain command (pnpm install/run, vite build or dev, vitest, svelte-check, tsc), a git write (add, commit, restore), or a Flutter ARB localization edit is needed — or when the model should really look at and click a running UI (a UI walkthrough, section 7). Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command; the browser itself is NOT this server (ADR-0005).
+description: Use in a sandboxed DSH session whenever a Flutter/Dart toolchain command (pub get, format, analyze, test, build), a Node toolchain command (pnpm or npm install/ci/run, npx, vite build or dev, vitest, svelte-check, tsc), a git write (add, commit, restore), or a Flutter ARB localization edit is needed — or when the model should really look at and click a running UI (a UI walkthrough, section 7). Starts one elevated, loopback-only server per session so the confined agent can run the toolchain over HTTP instead of paying a one-shot danger-full-access escalation per command; the browser itself is NOT this server (ADR-0005).
 ---
 
 <what-to-do>
@@ -238,14 +238,16 @@ $r.result.untranslated  # null, or {file, lines, content} — a warning, not a f
   below. Run `/health` first if you are unsure whether the deployed bridge has
   this sub-tool: it reports `tools`.
 
-## 6. Node toolchain: pnpm, vite, vitest, svelte-check
+## 6. Node toolchain: pnpm or npm, vite, vitest, svelte-check
 
-`pnpm` is accepted by verb (`install`, `i`, `add`, `remove`, `update`, `rebuild`,
-`dedupe`, `run`, `exec`, `why`, `list`, `outdated`, `audit`, `licenses`), and the
-project's own tools are commands of their own:
+A package manager is accepted by verb, and the project's own tools are commands
+of their own:
 
 ```powershell
 $r = Invoke-Run 'pnpm' @('install')                       # also runs the build scripts
+$r = Invoke-Run 'npm'  @('ci')                            # strict install; never rewrites the lockfile
+$r = Invoke-Run 'npm'  @('test')                          # == npm run test (a shorthand)
+$r = Invoke-Run 'npx'  @('vitest','run')                  # an exec form, not a manager
 $r = Invoke-Run 'vitest' @('run','--pool=threads')        # digest + known-failure split
 $r = Invoke-Run 'vite' @('build')
 $r = Invoke-Run 'svelte-check' @('--tsconfig','./tsconfig.json')
@@ -254,14 +256,20 @@ $r = Invoke-Run 'tsc' @('--noEmit')                       # inside the project
 
 What the surface is, and why:
 
+- **Pick the manager your project actually uses.** `pnpm` and `npm` are peers
+  here, on the same terms (ADR-0006): a repository forked from an npm upstream is
+  driven with `npm`. **The bridge never detects which one a project wants** — the
+  lockfile is advisory, so naming the wrong manager is allowed and may write the
+  other's lockfile. `/health.commands` lists what this session accepts; if `npm`
+  is missing there, the deployed skill predates this support.
 - **The accepted names are `vite`, `vitest`, `svelte-check`, `svelte-kit`, `tsc`**
-  plus `pnpm` (`/health.commands` lists them). Each is resolved inside the pinned
+  plus `pnpm`, `npm` and `npx`. Each script binary is resolved inside the pinned
   cwd's `node_modules` by reading the package's `bin` field — so `tsc` finds
   `typescript`, `svelte-kit` finds `@sveltejs/kit` — and runs under `node`.
   Never through `.bin/*.CMD`: that is a shell wrapper, and running it would put
   `cmd.exe` back in the middle of an argv that is supposed to have no shell.
   A tool that is not installed is a job failure naming the missing
-  `node_modules/<pkg>/package.json`, so run `pnpm install` first.
+  `node_modules/<pkg>/package.json`, so install first.
 - **A script binary must be run from the pinned cwd.** It is looked up in
   `<cwd>/node_modules` and nowhere else, so a bridge pinned at the wrong
   directory fails loudly rather than running a different project's vite.
@@ -271,15 +279,32 @@ What the surface is, and why:
   pool works. Under the bridge it does not matter — but keeping it makes a
   command portable between the two, and it is what makes a confined run possible
   at all.
-- **`pnpm exec` takes only those five names.** Measured, `pnpm exec node
-  --version` and `pnpm exec cmd /c echo hi` both work because pnpm falls back to
-  `PATH`; accepting that would be general command execution behind an
-  allowlisted verb. Everything else is a `403` that names `pnpm run <script>`.
-  `-c`/`--shell-mode` is refused with it.
-- **The cwd-retargeting flags are refused** on every verb: `-C`, `--dir`,
-  `--prefix`, `-w`, `--workspace-root`, `-g`, `--global`. The pinned cwd is an
-  ADR-0002 invariant, and `-g` leaves the project entirely. `pnpm dlx`,
-  `publish`, `config`, `setup` and `store` are absent by omission.
+- **The verbs are per manager, because the tools differ.** `pnpm`: `install`, `i`,
+  `add`, `remove`, `rm`, `uninstall`, `update`, `up`, `upgrade`, `rebuild`,
+  `dedupe`, `run`, `run-script`, `exec`, `why`, `list`, `ls`, `outdated`, `audit`,
+  `licenses`. `npm`: the same list plus `ci` and `explain` — and note that
+  `npm ls` lists *installed packages* where `pnpm ls` lists *scripts*.
+- **`npm test` and `npm start` are shorthands** for `npm run test` /
+  `npm run start`, normalised before the job is built, so the lane guess, the job
+  JSON and the digest all see the `run` form. Only those two: `npm build` is a
+  403, because npm itself does not understand it.
+- **An exec form takes only those five names.** `pnpm exec`, `npm exec` and `npx`
+  are the same shape with three spellings — `npx` *is* `npm exec` with the package
+  named implicitly, so it has no verbs (`npx install` is refused like
+  `npx cowsay`). Measured, `pnpm exec node --version` and `pnpm exec cmd /c echo
+  hi` both work because they fall back to `PATH`, and npx additionally *fetches*
+  what it cannot find; accepting that would be general command execution behind an
+  allowlisted name. Everything else is a `403` naming the manager's own
+  `run <script>`. `-c`/`--shell-mode`, and `-p`/`--package` (fetch this tarball)
+  are refused with it.
+- **The cwd-retargeting flags are refused** on every verb of either manager:
+  `-C`, `--dir`, `--prefix`, `-w`, `--workspace-root`, `--workspace`, `-g`,
+  `--global`. The pinned cwd is an ADR-0002 invariant, and `-g` leaves the project
+  entirely. One flag is judged by its *value*: `--location=global` (and `=user`)
+  targets the machine prefix and is refused, while `--location=project` is
+  accepted. `pnpm dlx`, `npm link`/`unlink`, `publish`, `config`, `setup` and
+  `store` are absent by omission — both managers can write machine state outside
+  the project through them.
 
 ### Long jobs: dev servers and watch mode
 
@@ -299,8 +324,10 @@ Invoke-RestMethod "http://127.0.0.1:$port/jobs/$($r.id)/kill" -Method Post -Head
 ```
 
 - **Inferred**: `vite dev`/`serve`/`preview`, bare `vite`, `vitest` without
-  `run`/`--run`, and `pnpm run <script>` for a script named
-  `dev`/`start`/`serve`/`watch`/`storybook`. `--help`/`--version` probes are
+  `run`/`--run`, and `run <script>` on either manager for a script named
+  `dev`/`start`/`serve`/`watch`/`storybook` — reached as `pnpm run dev`,
+  `npm run dev`, `npm start` (normalised to `npm run start`) or through an exec
+  form (`pnpm exec vite dev`, `npx vite`). `--help`/`--version` probes are
   excluded.
 - **`long: true` overrides the guess either way** — pass it when a script has an
   unusual name, or `long: false` when a long-looking name is actually one-shot.
@@ -568,10 +595,10 @@ Request body:
 [{"file": "C:/ws/test/desktop/alpha_test.dart", "name": "alpha refuses a bad key", "didNotComplete": false}]
 ```
 
-The same fields come back for a **vitest** run — `vitest run` and
-`pnpm exec vitest run` are recognised by their argv, and `pnpm run test` by the
-reporter's own markers in the log, because the script name is the project's word
-for it. What differs:
+The same fields come back for a **vitest** run — `vitest run`, `pnpm exec vitest
+run`, `npm exec vitest run` and `npx vitest run` are recognised by their argv, and
+`pnpm run test`/`npm run test`/`npm test` by the reporter's own markers in the
+log, because the script name is the project's word for it. What differs:
 
 - `file`/`name` are split on vitest's ` > `: `FAIL  src/App.test.ts > add > fails
   on purpose` becomes `file: "src/App.test.ts"`, `name: "add > fails on purpose"`
@@ -677,15 +704,16 @@ split, so a red local run can be read instead of re-diagnosed:
 - The registry is read per job from the pinned cwd, so adding an entry needs no
   restart. It lives in the project, so it can be committed and shared.
 
-## Git and pnpm: what it will and will not run
+## Git and the package managers: what it will and will not run
 
 - `flutter` and `dart`: any subcommand, any arguments.
-- `pnpm`: the named verbs in section 6 — no `dlx`, no `publish`, no `config`,
-  no `store`, and no cwd-retargeting flag. `exec` takes a project script binary.
+- `pnpm` and `npm`: the named verbs in section 6 — no `dlx`/`link`/`publish`/
+  `config`/`store`, and no cwd-retargeting flag. An exec form (`pnpm exec`,
+  `npm exec`, `npx`) takes a project script binary and nothing else.
 - the project's own `vite`, `vitest`, `svelte-check`, `svelte-kit`, `tsc`.
 - `git`: only `status`, `diff`, `log`, `add`, `commit`, `branch`, `restore` —
   and `branch` refuses `-d/-D/--delete/-m/-M/--move`.
-- Nothing else: no `npm`, no `npx`, no raw `node`, no `python`. **No `git push`**
+- Nothing else: no raw `node`, no `python`, no `yarn`, no `bun`. **No `git push`**
   (the GitHub token must never live in a long-running process — keep using the
   documented inline-token recipe), no
   `reset`/`clean`/`checkout`/`switch`/`stash` in any form. A `checkout` refusal
@@ -791,11 +819,17 @@ is still a fresh process. The wins are friction, correctness and observability.
   surface buys is *recovery cost and surprise* for a fallible one: every refused
   command is one nobody can lose work to. Refusals are therefore argued as "this
   can destroy unnamed work", not as "this escalates privilege".
-- `pnpm install` runs the project's dependency build scripts and `pnpm run` runs
-  whatever a `package.json` says, with that same access — the Node surface widens
-  *what a legitimate build does*, not what is reachable. `pnpm exec` is the case
-  where that reasoning would break, which is why it is narrowed to a project
-  script binary rather than trusted: measured, it also runs things on `PATH`.
+- `pnpm install`/`npm install` run the project's dependency build scripts, and
+  `run` on either manager runs whatever a `package.json` says, with that same
+  access — the Node surface widens *what a legitimate build does*, not what is
+  reachable. The exec forms are the case where that reasoning would break, which
+  is why each is narrowed to a project script binary rather than trusted:
+  measured, they also run things on `PATH`, and npx fetches what it cannot find.
+- Both managers are accepted, and neither is enforced against the project's own
+  lockfile: naming `npm` in a pnpm repository is allowed and may leave a
+  `package-lock.json` behind. The lockfile is advisory here, deliberately — see
+  ADR-0006 — so the caller is the one who has to know which manager the project
+  resolves with.
 - The real trust decision is the boot approval: the process holds that access for
   its lifetime, which is why the escalation is requested once, explicitly, and
   why the human gets the status page at boot.
@@ -868,17 +902,27 @@ is still a fresh process. The wins are friction, correctness and observability.
   same lane**; check `GET /jobs` and kill it if it is a hang. A job waiting behind
   a `long` job (a dev server) is normal and will not start until that one is
   killed.
-- **`403 pnpm flag not allowed: '-C'`** (or `--prefix`, `-g`, `-w`) → the flag
-  would run outside the pinned cwd, which no request can change (ADR-0002). Start
-  a bridge with the right `--cwd`, or drop the flag.
-- **`403 pnpm exec target not allowed: 'node'`** → `pnpm exec` runs anything it
-  finds on `PATH`, so only the project's own script binaries are accepted. Run a
-  package script with `pnpm run <script>` instead.
+- **`403 pnpm flag not allowed: '-C'`** (or `--prefix`, `-g`, `-w`,
+  `--workspace`; the same refusal reads `npm flag not allowed` under npm) → the
+  flag would run outside the pinned cwd, which no request can change (ADR-0002).
+  Start a bridge with the right `--cwd`, or drop the flag.
+- **`403 npm flag not allowed: '--location=global'`** → that value selects the
+  machine's global prefix. `--location=project` is accepted; only the global
+  values are refused.
+- **`403 pnpm exec target not allowed: 'node'`** (or `npm exec`/`npx exec target`)
+  → an exec form runs anything it finds on `PATH`, so only the project's own
+  script binaries are accepted. Run a package script with
+  `pnpm run <script>` / `npm run <script>` instead.
+- **`403 npm verb not allowed: 'build'`** → only `test` and `start` are npm's
+  shorthands; there is no `npm build`. Use `npm run build`.
+- **`npm` is not in `/health.commands`** → the deployed skill predates npm
+  support. Re-deploy (`python scripts/sync_to_skills.py`) and restart the bridge.
 - **`node is not on PATH`** → the bridge needs `node` to launch a script binary;
   install Node or put it on `PATH` for the process that starts the bridge.
 - **`vite is not installed in <cwd>: ... is missing`** → the pinned cwd has no
-  `node_modules/<pkg>`. Run `pnpm install` first, or check that the bridge was
-  started with the project's own directory.
+  `node_modules/<pkg>`. Run your manager's install (`pnpm install`,
+  `npm ci`) first, or check that the bridge was started with the project's own
+  directory.
 - **`vite`/`vitest` fails with `spawn EPERM`** → the sandbox, not the project. It
   denies the *named pipes* libuv needs for child stdio, which is what Vite's
   Windows `net use` probe and vitest's default forks pool use. Two traps:
@@ -937,8 +981,12 @@ is still a fresh process. The wins are friction, correctness and observability.
 wipes (`clean`, `git restore .`), `stash`, `checkout`/`switch`, per-job `cwd`
 and worktree-per-baseline entries, detached/persistent mode across sessions,
 arbitrary command execution *by name* (the bridge is not a privilege boundary —
-see the security model), `pnpm dlx`/`publish`/`config`/`store`, `pnpm exec` for
-anything but a project script binary, a per-request formatter or SDK override (the
+see the security model), `pnpm dlx` and `npm link`/`unlink`/`publish`/`config`/
+`store` (machine state outside the project), an exec-form target that is not a
+project script binary (which is what keeps `npx` from being a general runner),
+detecting the project's package manager from its lockfile (the lockfile is
+advisory, and a fork carrying both is the case ADR-0006 was written for), a
+per-request formatter or SDK override (the
 pin is boot-scoped, like the cwd) and a scope for any command but `dart format`, `dart
 analyze`/`fix` and `flutter analyze`/`fix`, copying build caches between
 worktrees (CMake/ninja

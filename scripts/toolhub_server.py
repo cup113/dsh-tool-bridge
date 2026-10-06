@@ -112,19 +112,22 @@ than looking like "everything is new" or "everything is known".
 
 Node toolchain
 --------------
-``pnpm`` runs a named verb set (``install``, ``add``, ``run``, ``exec``,
-``why``, ...; `dlx`, `publish`, `config` and `store` are absent on purpose) with
-its cwd-retargeting flags refused, and the project's own tools run directly:
-``vite``, ``vitest``, ``svelte-check``, ``svelte-kit`` and ``tsc`` are resolved
-out of ``<cwd>/node_modules`` by reading the package's ``bin`` field, so they
-work on Windows without letting a `.cmd` wrapper pull `cmd.exe` into an argv
-that is supposed to have no shell. `pnpm exec` accepts only one of those names,
-because it also runs anything on PATH.
+A package manager is accepted on the same terms whichever one a project uses —
+`pnpm`, or `npm` for a fork whose upstream tooling is npm (ADR-0006) — running a
+named verb set (`install`, `add`, `run`, `exec`, `why`, ...; `dlx`, `publish`,
+`config`, `store` and `link`/`unlink` are absent on purpose) with its
+cwd-retargeting flags refused. A project's own tools run directly: ``vite``,
+``vitest``, ``svelte-check``, ``svelte-kit`` and ``tsc`` are resolved out of
+``<cwd>/node_modules`` by reading the package's ``bin`` field, so they work on
+Windows without letting a `.cmd` wrapper pull `cmd.exe` into an argv that is
+supposed to have no shell. The exec forms — `pnpm exec`, `npm exec` and `npx` —
+accept only one of those names, because they also run anything on PATH, and npx
+fetches what it cannot find.
 
 Two runners feed the digest: `flutter test`/`dart test`, and vitest (recognised
-by its argv, or — for `pnpm run <script>`, whose script name is the project's
-own word for it — by the reporter's own markers in the log). Both get the same
-known-failure split.
+by its argv, or — for `pnpm run <script>`/`npm run <script>`, whose script name
+is the project's own word for it — by the reporter's own markers in the log).
+Both get the same known-failure split.
 
 Long jobs
 ---------
@@ -186,16 +189,67 @@ SCRIPT_BINARIES = {"vite", "vitest", "svelte-check", "svelte-kit", "tsc"}
 SCRIPT_BINARY_PACKAGES = {"tsc": "typescript", "svelte-kit": "@sveltejs/kit"}
 
 # What the bridge accepts, by executable name. `flutter` and `dart` take any
-# subcommand; `git` and `pnpm` are verb-guarded; a script binary is resolved
-# inside the pinned cwd.
-ALLOWED_EXES = {"flutter", "dart", "git", "pnpm"} | SCRIPT_BINARIES
+# subcommand; `git` is verb-guarded; a package manager (see PACKAGE_MANAGERS) is
+# verb-guarded; a script binary is resolved inside the pinned cwd.
+ALLOWED_EXES = {
+    "flutter",
+    "dart",
+    "git",
+    "npm",
+    "npx",
+    "pnpm",
+} | SCRIPT_BINARIES
+
+# The package managers the bridge runs. Both are here on the same terms — the
+# bridge does not detect which one a project uses (the lockfile is advisory, and
+# a fork may carry either), so the caller names the one its project actually
+# resolves to. ADR-0006 records why the second one was admitted.
+PACKAGE_MANAGERS = {"npm", "pnpm"}
+
+# `npx` is accepted, but as an exec form rather than a verb-guarded manager: it
+# *is* `npm exec` with the package argument implied. See validate_exec.
+PACKAGE_MANAGER_RUNNERS = PACKAGE_MANAGERS | {"npx"}
+
+# How a package manager's JavaScript entry point is found behind its Windows
+# wrapper, as paths relative to the wrapper's own directory. `npm.cmd` ships
+# next to `node_modules/npm`; a standalone pnpm ships `pnpm.exe` (used as it is)
+# or a wrapper beside its package. The general fallback is
+# `node_entry_from_shim`, which reads the wrapper itself — needed for a
+# corepack-managed install, whose wrapper names its own path.
+PACKAGE_MANAGER_ENTRIES: dict[str, tuple[tuple[str, ...], ...]] = {
+    "npm": (
+        ("node_modules", "npm", "bin", "npm-cli.js"),
+        ("node_modules", "npm", "bin", "npm-cli.cjs"),
+    ),
+    "npx": (
+        ("node_modules", "npm", "bin", "npx-cli.js"),
+        ("node_modules", "npm", "bin", "npx-cli.cjs"),
+    ),
+    "pnpm": (
+        ("node_modules", "pnpm", "bin", "pnpm.mjs"),
+        ("node_modules", "pnpm", "bin", "pnpm.cjs"),
+    ),
+}
+
+# Node's own npm ships *inside* the Node installation, next to `node.exe`, so its
+# wrapper directory has no `node_modules/npm` of its own to probe. Measured on
+# nvm4w: `%USERPROFILE%\nvm4w\nodejs\npm.CMD` is the wrapper and the entry is
+# `%USERPROFILE%\nvm4w\nodejs\node_modules\npm\bin\npm-cli.js` — the same layout,
+# one directory down, reachable through `node.exe`. Without this the layout probe
+# finds nothing and only the shim reader can answer, which is the weaker of the
+# two mechanisms.
+NODE_INSTALL_ENTRIES: tuple[tuple[str, ...], ...] = (
+    ("node_modules", "npm", "bin", "npm-cli.js"),
+    ("node_modules", "npm", "bin", "npm-cli.cjs"),
+)
 
 # pnpm verbs this server will run, for a vite+svelte workflow: install a tree
 # (including the dependency build scripts a *confined* install silently skips),
 # run the project's own scripts, change dependencies and inspect the result.
 # Excluded by omission: `dlx` (fetches and runs an arbitrary package), `publish`,
-# `config`/`setup`/`self-update` (they write machine state outside the project)
-# and `store` (machine-global).
+# `config`/`setup`/`self-update` (they write machine state outside the project),
+# `store` (machine-global) and `link`/`unlink` (a global symlink farm, i.e. the
+# same machine state by another route).
 PNPM_VERBS = {
     "install",
     "i",
@@ -219,29 +273,97 @@ PNPM_VERBS = {
     "licenses",
 }
 
+# The npm peer of PNPM_VERBS, for a project whose upstream tooling is npm — the
+# case ADR-0006 was written for. Same reasoning about omissions, with two npm
+# spellings of it:
+#
+# - `ci` is here and is the *strict* install: it resolves only from
+#   `package-lock.json` and never rewrites it, so it is the safe verb when the
+#   lockfile must not move. `install` is the one that may update it.
+# - `link`/`unlink`/`publish`/`config`/`init`/`pack`/`prune`/`owner`/`team`/
+#   `token`/`doctor`/`cache` are absent by omission for the reasons above.
+# - `test` and `start` are npm's bare-script shorthands and are normalised to
+#   `run test` / `run start` at submit time (NPM_RUN_SHORTHANDS), so the long-lane
+#   guess and the digest read the same argv every other script gets.
+#
+# Note that `ls` is *not* pnpm's `ls`: npm lists installed packages, pnpm lists
+# scripts. The verb is shared; the meaning is the manager's.
+NPM_VERBS = {
+    "install",
+    "i",
+    "ci",
+    "add",
+    "remove",
+    "rm",
+    "uninstall",
+    "update",
+    "up",
+    "upgrade",
+    "rebuild",
+    "dedupe",
+    "run",
+    "run-script",
+    "exec",
+    "why",
+    "explain",
+    "list",
+    "ls",
+    "outdated",
+    "audit",
+    "licenses",
+}
+
+# npm's bare-script shorthands: `npm test` and `npm start` mean `npm run test`
+# and `npm run start`, and nothing else may be abbreviated — `npm build` is not
+# a thing npm understands, so accepting it would invent a surface.
+NPM_RUN_SHORTHANDS = {"test", "start"}
+
+# Per-manager verb sets, so a refusal can name the list the caller actually
+# asked about.
+PACKAGE_MANAGER_VERBS: dict[str, set[str]] = {
+    "npm": NPM_VERBS,
+    "pnpm": PNPM_VERBS,
+}
+
 # Flags that retarget one of the bridge's two boot-scoped anchors — the pinned
 # cwd (ADR-0002), and "this project, not this machine". `-C`/`--dir`/`--prefix`
-# move the working directory, `-w`/`--workspace-root` moves it up to a workspace
-# root that may lie outside the pinned cwd, and `-g`/`--global` leaves the
-# project entirely. None is destructive; each just means "run somewhere this
-# session was never pointed at", which is the shape the git pathspec guard
-# refuses too.
-PNPM_BLOCKED_FLAGS = {
+# move the working directory, `-w`/`--workspace-root`/`--workspace` move it up to
+# a workspace root or sideways to a workspace package that may lie outside the
+# pinned cwd, and `-g`/`--global` leaves the project entirely. None is
+# destructive; each just means "run somewhere this session was never pointed
+# at", which is the shape the git pathspec guard refuses too.
+#
+# The same table serves both managers on purpose, and the two spellings of `-w`
+# are why: pnpm's `-w` is `--workspace-root`, npm's is `--workspace <name>`
+# (which is pnpm's `--workspace`, a name neither manager's short flag covers).
+# One flag, three retargets, one refusal.
+PACKAGE_MANAGER_BLOCKED_FLAGS = {
     "-C",
     "--dir",
     "--prefix",
     "-w",
     "--workspace-root",
+    "--workspace",
     "-g",
     "--global",
 }
 
-# `pnpm exec` looks in node_modules/.bin *and then on PATH*: measured,
-# `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both work. Left
-# alone it would be general command execution behind an allowlisted verb, which
-# is the one thing the allowlist exists to prevent — so its target has to be a
-# script binary, and its shell mode stays out.
-PNPM_EXEC_BLOCKED_FLAGS = {"-c", "--shell-mode"}
+# `--location` is the one blocked flag whose *value* decides: npm's
+# `--location=global` targets the machine-wide prefix, while `--location=project`
+# stays in the project. A name-only entry cannot express that, so it is checked
+# by value in flag_refusal.
+PACKAGE_MANAGER_LOCATION_FLAG = "--location"
+PACKAGE_MANAGER_GLOBAL_LOCATIONS = {"global", "user"}
+
+# Why the exec forms are narrowed rather than banned:
+#
+# `pnpm exec`/`npm exec`/`npx` look in node_modules/.bin *and then on PATH*:
+# measured, `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both work,
+# and npx additionally *fetches* a package it cannot find. Left alone that is
+# general command execution behind an allowlisted verb, which is the one thing
+# the allowlist exists to prevent — so the exec target has to be a script binary,
+# `--package`/`-p` (fetch this tarball) stays out, and shell mode stays out.
+EXEC_BLOCKED_FLAGS = {"-c", "--shell-mode", "-p", "--package"}
 
 # The long job lane. A serialized queue is the right shape for compiles and test
 # runs, and the wrong one for a process that never exits: `vite dev` would hold
@@ -730,18 +852,41 @@ def is_test_run(argv: list[str]) -> bool:
     return command_name(argv[0]) in ("flutter", "dart") and argv[1] == "test"
 
 
-def is_vitest_run(argv: list[str]) -> bool:
-    """Whether argv certainly runs vitest — the binary, or `pnpm exec vitest`.
+def exec_target(argv: list[str]) -> tuple[str, list[str]] | None:
+    """Peel an exec form: the script binary it runs, and its own arguments.
 
-    `pnpm run test` also runs vitest and cannot be told from the argv, which is
-    what `might_run_vitest` plus the log sniff are for.
+    `pnpm exec vitest run`, `npm exec vitest run` and `npx vitest run` all mean
+    "run the project's vitest", so they are one shape with three spellings.
+    Returns None for anything else, including an exec form with no target.
     """
-    name = command_name(argv[0]) if argv else ""
-    if name == "vitest":
+    if not argv:
+        return None
+    name = command_name(argv[0])
+    if name == "npx":
+        rest = argv[1:]
+    elif name in PACKAGE_MANAGERS and len(argv) > 1 and argv[1] == "exec":
+        rest = argv[2:]
+    else:
+        return None
+    positional = [token for token in rest if token != "--"]
+    if not positional or positional[0].startswith("-"):
+        return None
+    return command_name(positional[0]), positional[1:]
+
+
+def is_vitest_run(argv: list[str]) -> bool:
+    """Whether argv certainly runs vitest — the binary, or an exec form of it.
+
+    `pnpm run test` (and `npm run test`, or the `npm test` shorthand) also runs
+    vitest and cannot be told from the argv, which is what `might_run_vitest`
+    plus the log sniff are for.
+    """
+    if not argv:
+        return False
+    if command_name(argv[0]) == "vitest":
         return True
-    if name == "pnpm" and len(argv) > 2 and argv[1] == "exec":
-        return command_name(argv[2]) == "vitest"
-    return False
+    peeled = exec_target(argv)
+    return peeled is not None and peeled[0] == "vitest"
 
 
 def might_run_vitest(argv: list[str]) -> bool:
@@ -750,7 +895,9 @@ def might_run_vitest(argv: list[str]) -> bool:
     Only a gate for the content sniff, so a `git log` or `dart analyze` job
     never opens its log looking for a reporter it cannot have.
     """
-    return bool(argv) and command_name(argv[0]) in ("pnpm", "vitest")
+    return bool(argv) and command_name(argv[0]) in (
+        PACKAGE_MANAGER_RUNNERS | {"vitest"}
+    )
 
 
 def split_path_and_name(text: str) -> tuple[str | None, str]:
@@ -1045,9 +1192,9 @@ def analyze_test_log(argv: list[str], log_path: str) -> TestLogDigest:
     """The digest for a job, whichever runner produced its log.
 
     Two runners are read — `flutter test`/`dart test`, and vitest. What a command
-    *is* decides the parser, except for `pnpm run <script>`: the script name is
-    the project's own word for what it runs, so there the log content is the
-    only evidence. Anything else has no digest at all.
+    *is* decides the parser, except for `run <script>`: the script name is the
+    project's own word for what it runs, so there the log content is the only
+    evidence. Anything else has no digest at all.
     """
     if is_test_run(argv):
         return parse_flutter_log(log_path)
@@ -1561,6 +1708,9 @@ class ToolHub:
     ) -> Job:
         """Queues a command. `long` defaults to what the command looks like."""
         argv = build_argv(cmd, args, message)
+        # Before validation, so the normalised form is what the guess, the job
+        # JSON and the digest all read (ADR-0006: npm's bare-script shorthands).
+        shorthand_to_run(argv)
         validate(argv)
         if long is None:
             long = wants_long_lane(cmd, list(args))
@@ -1782,30 +1932,37 @@ def dart_format_target(argv: list[str], pin: str | None) -> str | None:
 def wants_long_lane(cmd: str, args: list[str]) -> bool:
     """Whether a command is expected to run until someone kills it.
 
-    Peeling `pnpm exec`/`pnpm run` first, the shapes that are certainly long are
-    vite's dev server and vitest's watch mode; a `pnpm run <script>` cannot be
-    known (the name is the project's), so the conventional server/watcher names
-    in ``LONG_SCRIPTS`` count too. Both error directions argue for guessing:
-    a long job left on the queue lane starves every build behind it until it is
-    killed, while a one-shot job put on the long lane merely occupies that lane
-    until it exits. `--help`/`--version` are excluded so a probe never lands
-    there at all.
+    Peeling an exec form first, the shapes that are certainly long are vite's dev
+    server and vitest's watch mode; a `run <script>` cannot be known (the name is
+    the project's), so the conventional server/watcher names in ``LONG_SCRIPTS``
+    count too. Both error directions argue for guessing: a long job left on the
+    queue lane starves every build behind it until it is killed, while a one-shot
+    job put on the long lane merely occupies that lane until it exits.
+    `--help`/`--version` are excluded so a probe never lands there at all.
+
+    `npm test`/`npm start` reach here already normalised to `run test`/`run
+    start` by ``validate``, which is why the shorthand needs no case of its own.
     """
     parts = list(args)
     exe = command_name(cmd)
-    if exe == "pnpm":
+    if exe in PACKAGE_MANAGERS:
         verb = parts[0] if parts else ""
         rest = parts[1:]
         if verb == "exec":
-            parts = rest
-            if not parts:
+            peeled = exec_target([cmd, *args])
+            if peeled is None:
                 return False
-            exe, parts = command_name(parts[0]), parts[1:]
+            exe, parts = peeled
         elif verb in ("run", "run-script"):
             script = next((token for token in rest if not token.startswith("-")), None)
             return script in LONG_SCRIPTS
         else:
             return False
+    elif exe == "npx":
+        peeled = exec_target([cmd, *args])
+        if peeled is None:
+            return False
+        exe, parts = peeled
     if any(token in ("--help", "-h", "--version", "-v") for token in parts):
         return False
     positional = [token for token in parts if not token.startswith("-")]
@@ -1857,8 +2014,8 @@ def resolve_launch(
     if name in SCRIPT_BINARIES:
         target = resolve_script_binary(cwd or os.getcwd(), name)
         return ([node_exe(), target, *argv[1:]], {})
-    if name == "pnpm":
-        return ([*resolve_pnpm(), *argv[1:]], {})
+    if name in PACKAGE_MANAGER_RUNNERS:
+        return ([*resolve_package_manager(name), *argv[1:]], {})
     exe = shutil.which(argv[0])
     if exe is None:
         raise FileNotFoundError(f"executable not found on PATH: {argv[0]}")
@@ -1937,56 +2094,121 @@ def resolve_script_binary(cwd: str, name: str) -> str:
     return target
 
 
-def resolve_pnpm() -> list[str]:
-    """How to launch pnpm as a real executable.
+def resolve_package_manager(name: str) -> list[str]:
+    """How to launch a package manager as a real executable.
 
-    On Windows `pnpm` on PATH is `pnpm.CMD` (or `.ps1`), which CreateProcess
-    cannot execute. A standalone pnpm ships `pnpm.exe` and is used as it is;
-    otherwise the wrapper's JavaScript entry is located — first by the layout
-    every npm/pnpm install uses, then by reading the wrapper itself, because a
-    corepack-managed install names its own path. Raises FileNotFoundError.
+    On Windows `npm`, `npx` and `pnpm` on PATH are `.cmd` wrappers, which
+    CreateProcess cannot execute. A standalone pnpm ships `pnpm.exe` and is used
+    as it is; otherwise the wrapper's JavaScript entry is located — first by the
+    layout the tool's own install uses (`PACKAGE_MANAGER_ENTRIES`), then by
+    reading the wrapper itself, because a corepack-managed install names its own
+    path. Raises FileNotFoundError.
     """
-    exe = shutil.which("pnpm")
+    exe = shutil.which(name)
     if exe is None:
         raise FileNotFoundError(
-            "pnpm is not on PATH — install it, or run the project's scripts with "
-            "its package manager"
+            f"{name} is not on PATH — install it, or run the project's scripts "
+            "with its own package manager"
         )
     if exe.lower().endswith(".exe"):
         return [exe]
     base = os.path.dirname(exe)
-    for parts in (
-        ("node_modules", "pnpm", "bin", "pnpm.mjs"),
-        ("node_modules", "pnpm", "bin", "pnpm.cjs"),
-    ):
+    for parts in PACKAGE_MANAGER_ENTRIES.get(name, ()):
         candidate = os.path.join(base, *parts)
         if os.path.isfile(candidate):
             return [node_exe(), candidate]
+    # Node's own npm and npx live one directory down, beside `node.exe`. Scoped
+    # to those two on purpose: pnpm is never bundled with Node, and probing the
+    # Node installation for it would answer with *npm's* entry whenever `which`
+    # is pointed elsewhere (which is exactly how the pnpm tests fake a wrapper).
+    if name in ("npm", "npx"):
+        node = shutil.which("node")
+        if node is not None:
+            node_dir = os.path.dirname(node)
+            suffix = "npx-cli" if name == "npx" else "npm-cli"
+            for parts in NODE_INSTALL_ENTRIES:
+                candidate = os.path.join(node_dir, *parts)
+                if suffix in os.path.basename(candidate) and os.path.isfile(candidate):
+                    return [node_exe(), candidate]
     entry = node_entry_from_shim(exe)
     if entry is not None:
         return [node_exe(), entry]
     raise FileNotFoundError(
-        f"cannot find pnpm's JavaScript entry point behind the wrapper {exe}"
+        f"cannot find {name}'s JavaScript entry point behind the wrapper {exe}"
     )
+
+
+def resolve_pnpm() -> list[str]:
+    """`resolve_package_manager("pnpm")`, kept as its own name for callers."""
+    return resolve_package_manager("pnpm")
 
 
 def node_entry_from_shim(shim: str) -> str | None:
     """The JS entry a `.cmd` wrapper launches, read out of the wrapper itself.
 
-    The last `node_modules\\...\\x.{mjs,cjs,js}` path in the file is the one it
-    runs: npm- and corepack-generated wrappers put their single `node "<entry>"`
-    call at the end.
+    Needed for a corepack-managed install, whose wrapper names its own path, so
+    the layout probe beside it cannot find the package.
+
+    Written with plain string work rather than a regular expression on purpose.
+    Two attempts at a pattern both failed on the same trap: `\\r\\n` inside a
+    character class means the literal letters `r` and `n` in a raw string, and
+    the real newline characters only in a non-raw one, so the pattern silently
+    refused to match `node_modules` and read nothing at all. Splitting on the
+    separators has no such hidden state.
+
+    Two details decide whether this works on a real wrapper:
+
+    - **Batch path variables are not paths.** Node's own `npm.cmd` writes
+      `"%~dp0\\node_modules\\npm\\bin\\npm-cli.js"`, and `%~dp0` expands to the
+      wrapper's directory *with* a trailing separator, while pnpm's wrapper
+      writes `"%dp0%\\node_modules\\pnpm\\bin\\pnpm.mjs"` and leaves the
+      separator to the surrounding text. Either way the variable is dropped and
+      the remainder resolved against the wrapper's directory.
+    - **The last candidate that *exists* wins**, not the last one mentioned. A
+      wrapper may name several — `npm.cmd` names `npm-prefix.js` (a helper it
+      shells out to first) and `npm-cli.js` (the entry it runs) — so existence,
+      not position, is what separates them.
     """
     try:
         with open(shim, "r", encoding="utf-8", errors="replace") as handle:
             text = handle.read()
     except OSError:
         return None
-    matches = re.findall(r"node_modules[\\/][^\"'\s]+\.(?:mjs|cjs|js)", text)
-    if not matches:
-        return None
-    candidate = os.path.join(os.path.dirname(shim), *matches[-1].split("\\"))
-    return candidate if os.path.isfile(candidate) else None
+    base = os.path.dirname(shim)
+    paths: list[list[str]] = []
+    for token in text.replace("\r\n", "\n").replace('"', "\n").split("\n"):
+        if not token.lower().strip().endswith((".mjs", ".cjs", ".js")):
+            continue
+        cleaned = token.strip()
+        if cleaned.upper().startswith("SET"):
+            cleaned = cleaned[3:].strip()
+        if "=" in cleaned:
+            # `SET "NPM_CLI_JS=%~dp0\..."`: the name is not part of the path.
+            _, _, cleaned = cleaned.partition("=")
+        for variable in ("%~dp0", "%dp0%", "%CD%"):
+            # `%~dp0` carries its own trailing separator; `%dp0%` does not.
+            if cleaned.startswith(variable):
+                cleaned = cleaned[len(variable) :].lstrip("\\/")
+                break
+        if "=" in cleaned:
+            # Still an assignment, so not a path.
+            continue
+        parts = [part for part in cleaned.replace("/", "\\").split("\\") if part]
+        if len(parts) >= 2:
+            paths.append(parts)
+    # Every wrapper this has to read names its entry `<tool>-cli.<ext>` — npm's
+    # `npm-cli.js`, npx's `npx-cli.js`, corepack's `corepack.js` (no suffix, so
+    # the fallback covers it) — while the helpers beside them do not
+    # (`npm-prefix.js`). That name is the reliable signal; position is not,
+    # because a wrapper may name the entry and then, later, a helper it also
+    # calls. Among equally good candidates the last one wins, since a wrapper's
+    # final assignment is the one its last invocation uses.
+    preferred = [parts for parts in paths if "-cli." in parts[-1]]
+    for parts in reversed(preferred or paths):
+        resolved = os.path.join(base, *parts)
+        if os.path.isfile(resolved):
+            return resolved
+    return None
 
 
 def command_name(cmd: str) -> str:
@@ -1998,7 +2220,15 @@ def command_name(cmd: str) -> str:
 
 
 def validate(argv: list[str]) -> None:
-    """Refuses anything outside the documented surface. Raises ValueError."""
+    """Refuses anything outside the documented surface. Raises ValueError.
+
+    May *normalise* ``argv`` in place — `npm test` becomes `npm run test` — so
+    the caller must treat the list it passed as possibly rewritten. One caller
+    holds the spawned argv (``ToolHub.submit``), which is what makes the rewrite
+    visible everywhere downstream: the job JSON, the long-lane guess and the
+    digest all read the normalised form rather than the caller's typing.
+    """
+    shorthand_to_run(argv)
     exe = command_name(argv[0])
     if exe not in ALLOWED_EXES:
         raise ValueError(
@@ -2006,8 +2236,10 @@ def validate(argv: list[str]) -> None:
         )
     if exe == "git":
         validate_git(argv[1:])
-    elif exe == "pnpm":
-        validate_pnpm(argv[1:])
+    elif exe in PACKAGE_MANAGERS:
+        validate_package_manager(exe, argv[1:])
+    elif exe == "npx":
+        validate_npx(argv[1:])
 
 
 def validate_git(args: list[str]) -> None:
@@ -2037,6 +2269,21 @@ def validate_git(args: list[str]) -> None:
         )
 
 
+def shorthand_to_run(argv: list[str]) -> None:
+    """Rewrites `npm test` / `npm start` into `npm run test` / `npm run start`.
+
+    Done to the argv list in place, before validation and before the long-lane
+    guess, so the shorthand is not a second surface: everything downstream reads
+    the same `run <script>` argv every other script gets. `test` and `start` are
+    the only two names npm itself abbreviates — `npm build` is not a thing — so
+    nothing else is accepted as one.
+    """
+    if len(argv) < 2 or command_name(argv[0]) != "npm":
+        return
+    if argv[1] in NPM_RUN_SHORTHANDS:
+        argv[:] = [argv[0], "run", *argv[1:]]
+
+
 def blocked_flag(token: str, blocked: set[str]) -> str | None:
     """The blocked flag a token sets, if any.
 
@@ -2058,82 +2305,136 @@ def blocked_flag(token: str, blocked: set[str]) -> str | None:
     return None
 
 
-def pnpm_refusal(flag: str) -> str:
-    """Why a pnpm flag is refused, and what to do instead."""
+def flag_refusal(manager: str, flag: str) -> str:
+    """Why a retargeting flag is refused, and what the caller meant by it."""
+    where = "the pinned working directory" if manager == "pnpm" else "the pinned cwd"
     return (
-        f"pnpm flag not allowed: {flag!r} — it would run outside the pinned "
-        "working directory (or outside the project); the bridge pins one cwd "
-        "per session and no request can retarget it"
+        f"{manager} flag not allowed: {flag!r} — it would run outside {where} "
+        "(as a different directory, a workspace root, a workspace package, or the "
+        "machine's global prefix); the bridge pins one cwd per session and no "
+        "request can retarget it"
     )
 
 
-def validate_pnpm(args: list[str]) -> None:
-    """The `pnpm` surface: named verbs, no retargeting, `exec` guarded.
+def location_refusal(manager: str, value: str) -> str:
+    """Why `--location=<global>` is refused while `--location=project` is not."""
+    return (
+        f"{manager} flag not allowed: '--location={value}' — it selects the "
+        "machine's global prefix, which is outside the pinned project; "
+        "'--location=project' is accepted"
+    )
 
-    The verb list is an allow list (unlike `flutter`/`dart`, which take any
-    subcommand) because the interesting question for a package manager is what
-    it is allowed to touch, and the answer differs per verb.
+
+def location_value(token: str) -> str | None:
+    """The value of a `--location` token, in either of its shapes.
+
+    npm writes it as `--location=global` or as the two tokens
+    `--location global`, so both have to be read to refuse the global one.
     """
-    if not args:
-        raise ValueError("pnpm needs a verb")
-    verb = args[0]
-    hit = blocked_flag(verb, PNPM_BLOCKED_FLAGS)
-    if hit is not None:
-        raise ValueError(pnpm_refusal(hit))
-    if verb.startswith("-"):
-        raise ValueError(f"pnpm needs a verb before flags: {verb!r}")
-    if verb not in PNPM_VERBS:
-        raise ValueError(
-            f"pnpm verb not allowed: {verb!r} (allowed: {sorted(PNPM_VERBS)})"
-        )
-    if verb == "exec":
-        validate_pnpm_exec(args[1:])
-        return
-    guard_pnpm_flags(args[1:], set())
+    if token == PACKAGE_MANAGER_LOCATION_FLAG:
+        return ""
+    head, sep, tail = token.partition("=")
+    if sep and head == PACKAGE_MANAGER_LOCATION_FLAG:
+        return tail
+    return None
 
 
-def guard_pnpm_flags(args: list[str], extra: set[str]) -> None:
-    """Refuses retargeting flags, up to the `--` that ends pnpm's own surface."""
-    for token in args:
+def check_retargeting(manager: str, tokens: list[str], extra: set[str]) -> None:
+    """Refuses a retargeting flag anywhere in a remaining-argv list.
+
+    Stops at the `--` that ends the manager's own surface: everything after it
+    belongs to the script or binary being run, where a token spelled like a
+    manager flag means something else entirely.
+    """
+    for index, token in enumerate(tokens):
         if token == "--":
             return
         if not token.startswith("-"):
             continue
-        hit = blocked_flag(token, PNPM_BLOCKED_FLAGS | extra)
+        hit = blocked_flag(token, PACKAGE_MANAGER_BLOCKED_FLAGS | extra)
         if hit is not None:
-            raise ValueError(pnpm_refusal(hit))
+            raise ValueError(flag_refusal(manager, hit))
+        value = location_value(token)
+        if value is None:
+            continue
+        if not value:
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            value = following if not following.startswith("-") else ""
+        if value in PACKAGE_MANAGER_GLOBAL_LOCATIONS:
+            raise ValueError(location_refusal(manager, value))
 
 
-def validate_pnpm_exec(args: list[str]) -> None:
-    """`pnpm exec` may run one of the project's script binaries, and nothing else.
+def validate_package_manager(manager: str, args: list[str]) -> None:
+    """The package-manager surface: named verbs, no retargeting, `exec` guarded.
 
-    Measured: `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both
-    work, because pnpm falls back to PATH. Allowed as-is that would hand out
-    general command execution behind an allowlisted verb — the one thing this
-    list exists to prevent (ADR-0001) — so the target has to be a bare script
-    binary name. Anything else is a 403 naming `pnpm run`.
+    The verb list is an allow list (unlike `flutter`/`dart`, which take any
+    subcommand) because the interesting question for a package manager is what
+    it is allowed to touch, and the answer differs per verb — and, for `ls`,
+    per manager.
+
+    ``args`` is the *same list object* ``validate`` was handed (it is
+    ``argv[1:]``), so a shorthand rewrite here is visible to the caller.
+    """
+    if not args:
+        raise ValueError(f"{manager} needs a verb")
+    verb = args[0]
+    hit = blocked_flag(verb, PACKAGE_MANAGER_BLOCKED_FLAGS)
+    if hit is not None:
+        raise ValueError(flag_refusal(manager, hit))
+    if verb.startswith("-"):
+        raise ValueError(f"{manager} needs a verb before flags: {verb!r}")
+    verbs = PACKAGE_MANAGER_VERBS[manager]
+    if verb not in verbs:
+        raise ValueError(
+            f"{manager} verb not allowed: {verb!r} (allowed: {sorted(verbs)})"
+        )
+    if verb == "exec":
+        validate_exec(manager, args[1:])
+        return
+    check_retargeting(manager, args[1:], set())
+
+
+def validate_npx(args: list[str]) -> None:
+    """`npx` is an exec form, not a manager: it runs, it does not install.
+
+    `npx` **is** `npm exec` with the package named implicitly, so it gets the
+    exec narrowing and none of the verbs — there is no `npx install` to allow.
+    """
+    validate_exec("npx", args)
+
+
+def validate_exec(manager: str, args: list[str]) -> None:
+    """`npm exec`/`npx`/`pnpm exec` may run a project script binary, nothing else.
+
+    Measured: the exec forms reach `node --version` and `cmd /c echo hi` because
+    they fall back to PATH, and npx fetches what it cannot find. Allowed as-is
+    that would hand out general command execution behind an allowlisted name —
+    the one thing this list exists to prevent (ADR-0001) — so the target has to
+    be a bare script binary name. Anything else is a 403 naming the run verb.
     """
     target: str | None = None
     for token in args:
         if token == "--":
             continue
         if token.startswith("-"):
-            hit = blocked_flag(token, PNPM_BLOCKED_FLAGS | PNPM_EXEC_BLOCKED_FLAGS)
-            if hit is not None:
-                raise ValueError(pnpm_refusal(hit))
+            check_retargeting(manager, [token], EXEC_BLOCKED_FLAGS)
             continue
         target = token
         break
     if target is None:
         raise ValueError(
-            "pnpm exec needs a script binary to run, e.g. pnpm exec vitest run"
+            f"{manager} needs a script binary to run, e.g. {manager} vitest run"
         )
     if target not in SCRIPT_BINARIES:
+        substitute = (
+            "npm run <script>" if manager in ("npm", "npx") else "pnpm run <script>"
+        )
         raise ValueError(
-            f"pnpm exec target not allowed: {target!r} "
-            f"(allowed: {sorted(SCRIPT_BINARIES)}) — pnpm exec runs anything it "
-            "finds, including things on PATH, so only the project's own tools are "
-            "accepted; run a package script with 'pnpm run <script>' instead"
+            f"{manager} exec target not allowed: {target!r} "
+            f"(allowed: {sorted(SCRIPT_BINARIES)}) — it runs anything it finds, "
+            "including things on PATH (and npx fetches what it cannot find), so "
+            "only the project's own tools are accepted; run a package script "
+            f"with '{substitute}' instead"
         )
 
 

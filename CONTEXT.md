@@ -23,7 +23,7 @@ How many times a session had to leave the bridge to get a command run; the bridg
 _Avoid_: escalation hole, privilege leak, 提权口
 
 **Allowlist**:
-The set of executables (`flutter`, `dart`, `git`, `pnpm`, and the **Script binaries**) and the git/pnpm verbs the bridge accepts.
+The set of executables (`flutter`, `dart`, `git`, the **Package managers**, `npx`, and the **Script binaries**) and the git/package-manager verbs the bridge accepts.
 _Avoid_: sandbox, security boundary, whitelist, permission system
 
 **Guardrail**:
@@ -42,9 +42,21 @@ _Avoid_: per-request exe, SDK override, toolchain pin (too broad: `dart analyze`
 One of the project's own Node tools (`vite`, `vitest`, `svelte-check`, `svelte-kit`, `tsc`) that the bridge accepts by name and resolves inside the **Pinned cwd**'s `node_modules` by reading the package's `bin` field — never through the `.cmd` wrapper, which would put `cmd.exe` in the middle of an argv that is supposed to have no shell.
 _Avoid_: local binary, npx tool, node_modules/.bin (that is the wrapper, which is exactly what is bypassed)
 
-**`pnpm` surface**:
-The named `pnpm` verbs the bridge accepts (`install`, `add`, `run`, `exec`, `why`, …), with the cwd-retargeting flags refused and `exec` narrowed to a **Script binary** — because `exec` also runs anything on `PATH`.
-_Avoid_: package manager access, npm passthrough
+**Package manager**:
+`pnpm` or `npm` — the tool a project's own lockfile and docs name. The bridge knows the *name*; it never detects or enforces which one a project uses, so a fork carrying either lockfile is driven by naming the manager its upstream uses.
+_Avoid_: node package manager, PM, npm (that names one member, not the concept)
+
+**Package-manager surface**:
+The named verbs a **Package manager** accepts (`install`, `add`, `run`, `exec`, `why`, …), with the cwd-retargeting flags refused and `exec` narrowed to a **Script binary** — because `exec` also runs anything on `PATH`. The verb set is per manager, because the tools differ in fact: npm has `ci`, pnpm does not, and npm's `ls` lists packages where pnpm's lists scripts.
+_Avoid_: package manager access, npm passthrough (the two are peers, not one surface)
+
+**Exec form**:
+The shape that runs a **Script binary** through a **Package manager**: `pnpm exec`, `npm exec`, or `npx`. `npx` is one of these and not a manager of its own — it *is* `npm exec` with the package named implicitly — so it has no verbs and inherits the same narrowing.
+_Avoid_: npx runner, exec command, package runner
+
+**Run shorthand**:
+npm's own abbreviation of a script: `npm test` and `npm start`, normalised to `npm run test`/`npm run start` at submit time, so the **Long lane** guess, the job JSON and the **Digest** all read one argv. Only those two names, because they are the only two npm abbreviates.
+_Avoid_: alias, script shortcut, implicit run (it is not a verb of its own)
 
 **Uncommitted scope**:
 The `/run` field `scope: "uncommitted"`: the **Pinned cwd**'s uncommitted `.dart` files (staged, unstaged and untracked; deleted and ignored excluded), read once at submit time. `dart format` receives them as trailing paths — the **Expansion**; `analyze` and `fix` accept at most one directory, so there the same set narrows the returned log lines — the **Filter**.
@@ -222,11 +234,13 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 - A **Bridge** is started by exactly one **Escalation**; every job after that costs none, so the **Escalation count** is normally 1.
 - A **Job** has one **Job status**, one log, one **Lane**, and — for a test run — one **Digest**.
 - A **Long job** runs on the **Long lane**, so it is never counted by `aheadOf` for a **Queue** job; a **Queue** job is never blocked by it.
-- A **Script binary** is resolved in the **Pinned cwd** and runs under `node`; `pnpm exec` accepts one of those names and nothing else.
+- A **Script binary** is resolved in the **Pinned cwd** and runs under `node`; an **Exec form** accepts one of those names and nothing else.
+- A **Package manager** is chosen by the caller; a **Run shorthand** is normalised to `run <script>` before the **Long lane** guess, the job JSON and the **Digest** read the argv, so a shorthand is never a second surface.
 - A **Digest** holds one **Counts** and one **Failure inventory**; the **`Failing tests:` block** may supply paths to the inventory but never its order or completeness.
 - A **Flavor** decides whether the **Known-failure registry** applies to a **Digest**; it is read from the argv when that is enough and from the log when it is not.
 - A **Tail** and an optional **Log filter** shape a response, not a job: the raw log is never rewritten.
 - The **Allowlist** is a **Guardrail**; it is not a privilege boundary, because `dart` reaches arbitrary code.
+- The two **Package managers** share one retargeting guard but not one verb set; a lockfile is advisory, so naming the manager is the caller's call and the other manager's lockfile may be written by mistake.
 
 - A **UI walkthrough** drives an **App under test**: **Running** it is the Bridge's (a **Long job** in the **Pinned cwd**), **Driving** it is the browser MCP's, and the split is ADR-0005.
 - A **Browser tool** costs no **Escalation** and creates no **Job**: the browser MCP is spawned by the harness, holds none of the boot approval, and appears in no **Lane**.
@@ -251,7 +265,13 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 > **Dev:** "I need `vite dev` running to look at the page while I fix a test. Add it to the queue?"
 > **Maintainer:** "Not the **Queue** — a dev server never exits, so every build behind it would wait on a process that is working exactly as intended. It is a **Long job**, on the **Long lane**, and `pnpm run dev` is guessed onto it."
 > **Dev:** "Then `pnpm exec` is the way to run anything else, since pnpm falls back to PATH?"
-> **Maintainer:** "That fallback is the problem, not the feature — measured, `pnpm exec cmd /c echo hi` works. `exec` takes a **Script binary** name and nothing else; anything else is a 403 naming `pnpm run`."
+> **Maintainer:** "That fallback is the problem, not the feature — measured, `pnpm exec cmd /c echo hi` works. An **Exec form** takes a **Script binary** name and nothing else; anything else is a 403 naming its own run verb."
+> **Dev:** "The fork I'm working in uses npm upstream. So I escalate per npm command?"
+> **Maintainer:** "No — npm is a **Package manager** here on the same terms as pnpm (ADR-0006). It fails inside the sandbox for the very reason pnpm does, so the two are peers. `npx` comes with it, as an **Exec form** rather than a manager of its own, which is why `npx install` is refused."
+> **Dev:** "And `npm test`, without the `run`?"
+> **Maintainer:** "That is a **Run shorthand**: it becomes `npm run test` before anything reads the argv, so the **Long lane** guess and the **Digest** see exactly what `npm run test` would have given them. Only `test` and `start` — `npm build` is not npm."
+> **Dev:** "Then the bridge checks which lockfile is present and refuses the other manager?"
+> **Maintainer:** "It does not, deliberately. The lockfile is advisory: the **Package manager** is whatever the caller names. A fork carrying both lockfiles is exactly the case that motivated admitting npm, and a boot-scoped guess would have failed it."
 > **Dev:** "And `pnpm run test` — does that get the known-failure split?"
 > **Maintainer:** "Yes, and that is why a **Digest** has a **Flavor** read from the log: the argv `pnpm run test` says nothing about vitest, but the reporter's own markers do."
 > **Dev:** "The walkthrough found a button no user can reach. So the browser becomes a **Job** on the **Queue**, and I drive it from there?"
@@ -276,6 +296,10 @@ _Avoid_: stash (a different, deliberately absent mechanism), revert
 - "the summary says which failures are new" — resolved: it never does. The suffix counts known/new; **which** is `baseline.newFailures`, and a **Known-failure registry** that cannot be read claims nothing rather than counting everything as known.
 - "long-running job" / "background job" — resolved: a **Long job** on the **Long lane**. Nothing is detached from the bridge: it is still a **Job** with a log and a kill, and it is still serialized — just not against builds.
 - "`pnpm exec` is safe because pnpm only runs installed packages" — measured false: `pnpm exec node --version` and `pnpm exec cmd /c echo hi` both work, because pnpm falls back to `PATH`. That is why the **`pnpm` surface** narrows `exec` to a **Script binary** and refuses `-c/--shell-mode`.
+- "no npm, no npx" (README and SKILL.md) — resolved: both are accepted now, as a **Package manager** and an **Exec form** (ADR-0006). The old exclusion was drawn around our own usage rather than a measured difference: npm dies inside the sandbox for the same named-pipe reason pnpm does, and a fork kept in step with an npm upstream could not be driven through the bridge at all.
+- "the bridge knows which package manager the project uses" — resolved: it does not. The lockfile is advisory and the caller names the **Package manager**; nothing detects or enforces it, so `npm install` in a pnpm repository is allowed and writes a lockfile the project did not ask for.
+- "`npm exec` and `npx` are different things" — resolved: `npx` *is* `npm exec` with the package named implicitly, so both are **Exec forms** with the same narrowing; the difference is only that `npx` names the tool as its first argument.
+- "npm/npx were deliberate non-goals" — resolved: that stood only while no project needed them. Both are accepted now; what stays a non-goal is the *unnarrowed* form — `npx <anything>`, `npm link`/`publish`/`config`, and any cwd-retargeting flag.
 - "the sandbox denies `vite` because of a file" — resolved: the sandbox denies **pipes**. `spawn`/`exec`/`fork` with piped stdio throw `EPERM` (no named pipes), while `inherit`, a file fd, `worker_threads` and loopback TCP all work; that single mechanism explains Vite's `net use` probe, vitest's default forks pool and esbuild's service spawn (ADR-0004).
 - "killing a job is just `taskkill`" — resolved: it is not, under this sandbox. `taskkill /F /T` answers "access denied" while the target is alive, so the fallback to the owned process handle is part of the **Long job** feature rather than a detail: without it a killed dev server kept running *and* held its lane.
 - "让模型操纵浏览器进行测试" / "let the model test the UI" — resolved: two different capabilities. A **UI walkthrough** is exploratory live driving, and that is the one that was missing; a script-driven E2E run is a **Job** that already works through `/run` (`pnpm run <e2e script>`, `flutter test integration_test -d windows`). Only the first needed building (ADR-0005).

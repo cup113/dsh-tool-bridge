@@ -6,40 +6,22 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: tests (Python ${{ matrix.python }})
-    runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.11", "3.13", "3.14"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      # Standard library only: the suite needs no install step.
-      - run: python tests/test_toolhub.py
-
-  lint:
-    name: lint
+  checks:
+    name: build · types · tests
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: pnpm/action-setup@v4
         with:
-          python-version: "3.13"
-      - run: python -m pip install -r requirements-dev.txt
-      - run: ruff check .
-      - run: ruff format --check .
-
-  types:
-    name: types
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+          version: 10
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.13"
-      - run: python -m pip install -r requirements-dev.txt
-      - run: pyright scripts tests
+          node-version: "22"
+          cache: pnpm
+      # The plugin's @deepseek-ai/* peers are pinned to the harness line it was
+      # developed against; a floating install would test against a different
+      # harness than the one the types were read from.
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm build
+      - run: pnpm test

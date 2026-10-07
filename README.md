@@ -1,259 +1,273 @@
 # dsh-tool-bridge
 
-[![CI](https://github.com/cup113/dsh-tool-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/cup113/dsh-tool-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/cup113/dsh-tool-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/cup113/dsh-tool-bridge)
 
-A session-scoped, loopback-only toolchain server for **file-sandboxed agent
-sessions**. It is started once with one elevated approval and then runs
-`flutter`/`dart` (any subcommand), a Node toolchain — a package manager
-(`pnpm`, or `npm` for a fork whose upstream uses it, plus the narrowed `npx`)
-and the project's own `vite`/`vitest`/`svelte-check`/`svelte-kit`/`tsc` — a
-guard-railed `git` verb set
-and a couple of sub-tools on the agent's behalf over HTTP, so the confined agent
-pays **one approval per session instead of one per command**.
+A **DSH plugin** that gives a file-sandboxed session the toolchain its sandbox
+denies — `flutter`/`dart`, the project's own Node tools, a guard-railed `git`,
+`pnpm`/`npm` — as two native tools, one switch per conversation, and a sidebar
+panel. The browser half of a UI walkthrough (`@playwright/mcp`) is mounted the
+same way: per conversation, for the conversations that ask.
 
-The friction it removes is specific. Inside a `workspace-write` sandbox (DSH is
-the harness this was written for) the Flutter/Dart toolchain cannot run at all —
-it fails writing the SDK lockfile — and every `git` write is denied, because the
-git directory lives outside the workspace. A Node toolchain dies the same way for
-a different reason: the sandbox cannot create the named pipes libuv uses for child
-stdio, so `vite` (its Windows `net use` probe, and esbuild before Vite 8),
-`vitest`'s default forks pool and `esbuild` itself all fail with `spawn EPERM`
-(`docs/vite-vitest-sandbox-findings.md`). Note that the elevation is load-bearing
-for Vite too, not just Flutter: a bridge started *confined* still fails `vite
-build`, because the probe runs inside the vite process rather than in the bridge.
-An agent that wants to build, test or commit therefore needs a fresh elevation per
-command. This server *is* that elevation, spent once; every call after it is an
-ordinary confined HTTP request.
+It is the successor of a Python HTTP server that did the same job beside the
+harness. `docs/adr/0007-the-plugin-is-the-bridge.md` records why the plugin is
+not just the nicer shape but the *correct* one, and what did not survive the
+move.
 
-Along the way it also serializes jobs per lane (concurrent Flutter runs fight over
-`build/`, and two Vite builds share `dist/`), keeps a dev server off the queue so
-it cannot starve the builds behind it, captures UTF-8 logs regardless of the
-console code page, filters them server-side, digests `flutter test` **and** vitest
-results into counts and a failure inventory, keeps a job's process killable, and
-can line a local run up with what CI actually checks.
+## Why any of this is needed
 
-## Read this before running it
+Inside a `workspace-write` sandbox the Flutter/Dart toolchain cannot run at all
+— it fails writing the SDK lockfile — every `git` write is denied because the
+git directory lives outside the workspace, and a Node toolchain dies on
+`spawn EPERM`: the sandbox cannot create the named pipes libuv uses for child
+stdio, which is what takes down `vite` (its Windows `net use` probe), `vitest`'s
+default forks pool and `esbuild`
+(`docs/vite-vitest-sandbox-findings.md` records the measurements).
 
-**It is not a sandbox, and it is not a privilege boundary.** It holds, for its
-whole lifetime, the access your boot approval granted.
+The sandbox is applied **per capability call**: `ctx.sandbox.confine()` wraps the
+argv a consumer is about to spawn. The harness process itself is not confined,
+and neither are its children — so this plugin, running in that process, starts
+the toolchain directly, and nothing has to be approved per session because
+nothing is confined per session. That is the whole mechanism, and it is also the
+whole trust story: see **Installing it is the trust decision** below.
 
-- `dart` accepts any subcommand, so `dart run <file>.dart` executes arbitrary
-  code with that access. What the allowlist buys is *recovery cost and surprise*
-  for a fallible caller — a refused command is one you cannot lose work to — not
-  privilege (ADR-0001).
-- `pnpm install`/`npm install` run the project's dependency build scripts, and
-  `pnpm run`/`npm run` runs whatever a `package.json` says, with the same access.
-  The exec forms — `pnpm exec`, `npm exec`, `npx` — are accepted only for the
-  project's own script binaries, because they also run anything they find on
-  `PATH` (measured), and `npx` will fetch what it cannot find. `pnpm dlx`,
-  `npm link`, `publish`/`config`, `npx --package` and `pnpm store` are absent by
-  omission.
-- Whichever manager you name may write the *other's* lockfile — the lockfile is
-  advisory here, and no request is refused for the project using the other one
-  (ADR-0006). `npm ci` is the strict install that cannot rewrite the lockfile.
-- It binds `127.0.0.1` on an ephemeral port, and every route but `/health`
-  requires a bearer token. The token is never written to a file by the bridge: it
-  is printed to the job output that started it, and — when the status page opens
-  — it also lands in your browser's address bar and history, on the same machine
-  and for the same user who reads that output.
-- Deliberately absent: `git push` (a GitHub token must never live in a
-  long-running process), history rewriting, whole-worktree wipes, `stash`, and
-  `checkout`/`switch` in every form.
-- The callers are your own agent sessions on your own machine. If that is not
-  your trust model, this is the wrong tool.
+## What you get
 
-## Requirements
+**Two tools.** `bridge_run` runs one command and comes back with a job:
+`status`, `exitCode`, `durationSec`, the log tail, and — for a test run — the
+digest (`summary`, `counts`, the complete `failures` inventory) plus a
+`baseline` split against the project's `.toolbridge/known-failures.json`, whose
+`newFailures` names the failures your change introduced. `bridge_arb_edit` edits
+Flutter ARB localization files and runs `flutter gen-l10n` as one atomic
+operation, planning every file before writing any.
 
-- **Windows** — CI-verified. The code carries a POSIX fallback that nobody has
-  exercised, so treat elsewhere as untested rather than supported.
-- **Python 3.11+** for the server: standard library only, no dependencies.
-- `flutter`/`dart`, `git`, and `node` plus whichever package manager you name
-  (`pnpm`, `npm`, `npx`) on `PATH` for the jobs that use them. A script binary is
-  looked for in the pinned cwd's `node_modules`.
+Background work needs no third tool: every run is a `ctx.jobs` job, so the
+harness's own `job_output`, `job_list` and `job_kill` read and stop it, it
+appears in the harness's job roster, and a finished background job wakes its
+conversation with a completion notice.
+
+**Two switches, per conversation.** *Toolchain* (default on) and *Browser*
+(default off), as a row of labelled switches directly above the input box — the
+harness's own seat for entries above the composer card, so on a phone they get a
+row of their own instead of a fight with the conversation header. Turning a
+switch off removes that half's tool schemas from the conversation's prompts — for
+the browser half it also closes the MCP server, so a conversation that never looks
+at a page pays nothing for the ability to. State is durable per session: a resumed
+conversation keeps what it had. A switch shows *intent*, and the row says so when
+the fact differs — `browser starting…`, or the reason in red when the mount
+failed. The icon at the row's end opens the panel in the sidebar.
+
+**A sidebar panel** showing the conversation's working directory, both lanes'
+depth, the formatter pin, the browser's flags, every job with its digest
+summary, and the selected job's log — the thing the old server opened a browser
+tab for, without the token in the address bar and without a page that goes stale.
 
 ## Install
 
 ```powershell
-git clone https://github.com/cup113/dsh-tool-bridge
-cd dsh-tool-bridge
+dsh plugin --profile <profile> add <absolute path to this checkout>
 ```
 
-Then either read `SKILL.md` yourself, or deploy it where a DSH session discovers
-skills — the one step that needs an escalation, because it writes outside your
-workspace:
+Then restart the harness once. The plugin declares its own bundle layer
+(`dsh.bundle.patch`), so `plugin add` composes it; there is no profile patch row
+to hand-edit.
+
+**Install it by path (or from git), not with `link:`.** `@deepseek-ai/*` are
+peer dependencies, and inside a profile they resolve to the harness's own single
+copies through `~/.dsh/profiles/node_modules`. A `link:` install resolves them
+from this checkout instead, which puts a *second physical copy* of packages like
+`@deepseek-ai/dsh-tools` in the process — the failure that looks like every tool
+call dying with `Cannot read properties of undefined (reading 'prepare')`, and
+whose message never names the plugin. Verify after installing:
 
 ```powershell
-python scripts/sync_to_skills.py --dest "$env:USERPROFILE\.dsh\skills\tool-bridge"
+Test-Path "$env:USERPROFILE\.dsh\profiles\<profile>\node_modules\@deepseek-ai\dsh-tools"   # must be False
 ```
 
-`--dest` defaults to exactly that path. Note the deliberate split: the repository
-is `dsh-tool-bridge`, the skill it deploys is `tool-bridge`.
+### Configure it
 
-## Quickstart
+Configuration lives in the plugin's config schema, so a machine-specific value is
+a patch override in the profile — and a patch replaces the targeted row's whole
+`config`, so restate every key you keep:
 
-```powershell
-# 1. Start it. Run it plainly first: under the sandbox the boot self-check fails
-#    visibly on the SDK lockfile, and that failure is the grounded reason to
-#    retry the very same command with wider permissions.
-python -u <repo>\scripts\toolhub_server.py --cwd "<project>" --watch-parent
-
-# Elevated, the same command prints:
-#   TOOLHUB SELFTEST OK in 0.8s version=Flutter ...
-#   TOOLHUB READY port=60549 pid=16288 cwd=... logdir=...
-#   TOOLHUB TOKEN <token>
-#   TOOLHUB STATUS http://127.0.0.1:60549/?token=<token>
+```yaml
+- id: toolbridge
+  config:
+    dartFormatExe: C:/Tools/dart-3.12.2/bin/dart.exe
+    defaults:
+      bridge: true
+      browser: false
+    playwright:
+      browser: msedge
+      caps: vision,devtools
+      outputDir: C:/Users/me/AppData/Local/dsh-pw-mcp
+      toolCallTimeoutMs: 120000
 ```
 
-```powershell
-# 2. Drive it — confined, no escalation from here on.
-$port=60549; $tok='<token>'; $h=@{Authorization="Bearer $tok";'Content-Type'='application/json'}
-$body=@{cmd='flutter';args=@('test','test/features');wait=$true;timeoutSec=900}|ConvertTo-Json -Compress
-$r = Invoke-RestMethod "http://127.0.0.1:$port/run" -Method Post -Headers $h -Body $body
-"$($r.status) exit=$($r.exitCode) $($r.summary)"
-$r.failures   # the complete failure inventory, in run order
-$r.tail       # the last 200 log lines, UTF-8
-```
-
-## API
-
-| Method | Path | Purpose |
+| Field | Default | Meaning |
 |---|---|---|
-| GET | `/health` | liveness + `tools` + `commands` (the accepted executables) + `dartFormatExe` (the formatter pin, or null); no token |
-| GET | `/?token=…` | human status page: job list + live log tail (opened at boot) |
-| POST | `/run` | `{"cmd","args","message","scope","long","wait","timeoutSec","grep","tail"}` → job |
-| POST | `/tools/arb-edit` | ARB localization edits plus `flutter gen-l10n`, with a structured `result` |
-| GET | `/jobs` · `/jobs/<id>?tail=N&grep=P` · `/jobs/<id>/log` | job list · one job with a log view · the raw log |
-| POST | `/jobs/<id>/kill` · `/stop` | kill that job's process · kill children and exit |
+| `stateDir` | `$DSH_HOME/toolbridge` | Where the plugin keeps the per-session switch record and the job logs |
+| `defaults.bridge` | `true` | Whether a new conversation starts with the toolchain tools |
+| `defaults.browser` | `false` | Whether a new conversation starts with Playwright MCP mounted |
+| `dartFormatExe` | — | The formatter pin: the `dart.exe` CI formats with (see below) |
+| `playwright.browser` | `msedge` | The browser channel; `msedge` drives the Edge Windows already ships, so no download |
+| `playwright.caps` | `vision,devtools` | Playwright MCP capabilities: `vision` adds the coordinate mouse tools a canvas needs, `devtools` the recorders. Measured: 44 tools with both, ~25 for core alone |
+| `playwright.outputDir` | — | Where video, trace and PDF land — outside any workspace on purpose, for the human |
+| `playwright.toolCallTimeoutMs` | `120000` | Per-call MCP timeout; a screenshot or a stopped video can exceed the 60 s default |
+| `defaultTimeoutSec` | `600` | How long a foreground `bridge_run` waits inside the call before handing the job back still running |
 
-`SKILL.md` is the full reference: request shapes, the PowerShell traps that make a
-call look like a 404, caller-timeout nesting, and what every digest field means.
+## Using it
 
-## Four things worth knowing
+`bridge_run` is the front door. The accepted names are `flutter`, `dart`, `git`,
+`pnpm`, `npm`, `npx`, and the project's own `vite`/`vitest`/`svelte-check`/
+`svelte-kit`/`tsc`, resolved out of the job's working directory by reading the
+package's `bin` field — never through a `.cmd` wrapper, which would put
+`cmd.exe` in the middle of an argv that is supposed to have no shell.
 
-**Run the project's own Node tools, and keep the dev server out of the queue.**
-`{"cmd":"vite","args":["build"]}` and `{"cmd":"vitest","args":["run"]}` are
-accepted directly, and a package manager — `pnpm`, or `npm` for a fork whose
-upstream uses it, with `npx` accepted as its exec form — covers
-`install`/`ci`/`add`/`run`/`exec`/`why`/… A script binary is resolved out of the
-pinned cwd's `node_modules` by reading its package's `bin` field, so no `.cmd`
-wrapper drags `cmd.exe` into an argv that is supposed to have no shell. npm's
-bare-script shorthands (`npm test`, `npm start`) are normalised to
-`npm run test`/`npm run start`, so they are not a second surface. A command that
-is expected to run until it is killed
-(`vite dev`, `vite preview`, `vitest` in watch mode, a conventional
-`dev`/`start`/`serve`/`watch` script) runs on its **own lane** instead of the
-queue: `"long": true` says so explicitly, and the bridge otherwise guesses — the
-two error directions are not symmetric, since a dev server on the queue lane
-starves every build behind it until somebody kills it. `vitest` results get the
-same digest and known-failure split as `flutter test`, including the
-`Tests  no tests` shape a suite that failed to load produces.
+**Refusals are deliberate, and they are the only bound left** (ADR-0001). `dart`
+takes any subcommand, so `dart run <file>.dart` executes arbitrary code with this
+plugin's access; what the narrow surface buys is *recovery cost and surprise* for
+a fallible caller. Refused on that reasoning: `git push`, `reset --hard`,
+rebase, `clean`, `stash`, `checkout`/`switch`, `git restore .` (a pathspec guard:
+literal, relative, non-wildcard paths only), the cwd-retargeting flags on either
+package manager, and an exec form (`pnpm exec`, `npm exec`, `npx`) whose target
+is not one of the project's own script binaries — measured, they also run
+anything on `PATH`, and `npx` fetches what it cannot find.
 
-**Pin the formatter to CI's dart.** `dart format` output changes between SDK
+**Long jobs get their own lane.** A command that runs until killed — `vite dev`,
+`vitest` in watch mode, a `dev`/`start`/`serve`/`watch`/`storybook` script, or
+`long: true` — is serialized against other long jobs instead of against the
+builds, because a dev server on the queue lane starves everything behind it. The
+guess exists because the two error directions are not symmetric; the flag
+overrides it either way.
+
+**Lanes are keyed by working directory.** Concurrent Flutter runs corrupt
+`build/` and two Vite builds share `dist/`, so all runs in one directory are
+serialized — across conversations too. The cost is honest: a long build in one
+conversation delays a build in another conversation on the same directory, which
+is what already happened within one conversation.
+
+**Formatting the way CI formats.** `dart format` output changes between SDK
 releases, so formatting with a newer local dart is what turns CI's
-`dart format --set-exit-if-changed` check red. `--dart-format <dart.exe>` routes
-`dart format` jobs to the SDK a project's CI pins, verifies it at boot and
-reports it as `/health.dartFormatExe`. Everything else keeps the `PATH`
-toolchain on purpose: `dart analyze` also depends on the Flutter framework
-version resolved through the package config, which a formatter pin cannot align.
+`dart format --set-exit-if-changed` check red. Point `dartFormatExe` at the
+standalone dart whose version matches the Flutter version the project's workflow
+pins, and **only** `dart format` uses it — `dart analyze` deliberately keeps the
+local SDK, because its verdict also depends on the Flutter framework version
+resolved through the package config, which a formatter pin cannot align.
 
-```powershell
-python -u <repo>\scripts\toolhub_server.py --cwd "<project>" --watch-parent `
-  --dart-format C:\Tools\dart-3.12.2\bin\dart.exe
-```
+**Scoping to your uncommitted files.** `scope: "uncommitted"` reads the working
+tree once, at submit time, and narrows the command to its uncommitted `.dart`
+files. For `dart format` that is an **Expansion** — the files are appended to
+argv, so the formatter itself is narrowed, which is CI's changed-files check run
+locally. For `analyze`/`fix` no argv can name a file list (an analyzer takes at
+most one directory), so the same set narrows the returned lines instead and the
+exit code still covers the whole project: a **Filter**. Nothing uncommitted is a
+refusal, not a whole-tree format.
 
-**Scope a command to your uncommitted files.** `"scope": "uncommitted"` reads the
-working tree with `git status --porcelain -z` and narrows the command to the
-`.dart` files that are not committed yet. `dart format` receives them as trailing
-paths — CI's changed-files check, run locally — while `analyze` and `fix` accept
-at most one directory, so there the scope filters the returned lines instead. An
-empty set is a 400, because `dart format` with no paths rewrites the whole tree.
+**Timeouts never kill.** `timeoutSec` bounds how long the *call* waits for queue
+time plus run time; when it expires the job is unchanged and still running. Read
+it on with `job_output <id>`, stop it with `job_kill <id>`.
 
-**Ask "is this failure mine?" from data.** A project can record the failures that
-were already red before your change in `.toolbridge/known-failures.json`
-(platform-specific, flaky, not-yours-yet). A test job then annotates each claimed
-failure with `known`, reports `baseline.newFailures` — the complete, ordered list
-of the new ones — and appends the split to `summary`
-(`77 failed (74 known, 3 new)`). The split counts distinct tests rather than
-progress lines, so it can never contradict the count it sits next to, and a
-registry that cannot be read claims nothing and says so.
+## The browser half, and looking at the UI
 
-## Where the rest lives
+The split ADR-0005 drew is unchanged: **this plugin runs the app under test, the
+browser drives it.** Starting the app needs the toolchain (a Vite dev server
+dies inside the file sandbox), and driving is `@playwright/mcp` — reached as
+`mcp__ui__browser_*` tools. What changed is that the MCP client is no longer a
+resident profile row: turn the conversation's *Browser* switch on and the plugin
+mounts it into a scope minted for that conversation; turn it off (or end the
+conversation) and the connection and its server process go away.
 
-- `SKILL.md` — the agent-facing reference: start, drive, timeouts, the ARB
-  sub-tool, the test digest, the known-failure registry, and the **UI
-  walkthrough** loop (section 7).
-- `CONTEXT.md` — the vocabulary the code and the skill are written in (bridge,
-  escalation, guardrail, digest, format pin, uncommitted scope, UI walkthrough),
-  plus the ambiguities that were resolved to get there.
-- `docs/adr/` — the decisions that are expensive to reverse: the allowlist is a
-  guardrail rather than a privilege boundary; the working directory is pinned, so
-  there is no per-job `cwd` or baseline worktree; sub-tools are queue jobs with
-  structured results; npm is a package manager here on the same terms as pnpm
-  (ADR-0006); and the bridge drives the toolchain, not the UI.
-- `docs/browser-mcp.profile-row.yml` — the profile row that gives a session real
-  eyes and hands (`@playwright/mcp` over system Edge, via
-  `@deepseek-ai/dsh-mcp-client`), with the setup it belongs to.
-- `docs/vite-vitest-sandbox-findings.md` — the measurements behind the Node
-  surface: which commands the sandbox kills, with what error, and why Vite 7
-  cannot be rescued the way Vite 8 can.
-- `scripts/toolhub_server.py` — the canonical program; edits here are what run.
-  `scripts/arb_edit_lib.py` is the ARB edit logic behind the `arb-edit` sub-tool.
-- `scripts/sync_to_skills.py` — deploys `SKILL.md` plus `scripts/` as a skill, and
-  deliberately leaves `CONTEXT.md`, `docs/` and `tests/` in the repository.
+The loop: `bridge_run {cmd: "vite", args: ["dev"], long: true, background: true}`
+→ read the bound URL from the job's log → `mcp__ui__browser_navigate`,
+`browser_snapshot` (the accessibility tree as text — cheap, and the source of the
+element refs) → act by ref → `browser_console_messages` when the screen is blank
+→ screenshot or video as the artifact. Sight arrives two ways, an image block in
+the tool result or the same file read with the harness's image tool; neither is
+privileged, and the one rule is the claim — never report having seen a page you
+only have a path to. Make the finding repeatable by writing it as a script-driven
+run through `bridge_run`.
+
+## Installing it is the trust decision
+
+**This plugin is not a sandbox and not a privilege boundary.** Its children run
+with the harness's own access, unconfined, with no per-session approval — so the
+decision that used to be a `danger-full-access` escalation is now the decision to
+install it into a profile (ADR-0001, amended). That is a real trade: the refusal
+list described above is the only bound on what a conversation can do, and it
+bounds surprise and recovery cost rather than privilege.
+
+What is unchanged: `git push` is absent (a GitHub token must never live in a
+long-running process), history rewriting is absent, whole-worktree wipes are
+absent, and the callers are your own agent sessions on your own machine.
+Everything the plugin does per conversation is in the switch the human can see
+and turn off.
+
+## Requirements
+
+- **Windows** — CI-verified, and the platform the resolution logic is written
+  for. The retired server carried a POSIX fallback nobody had exercised; this
+  port states the platform instead of carrying an untested claim.
+- **Node 22+** for the plugin, and `node` on `PATH` for a script binary.
+- `flutter`/`dart`, `git`, and whichever package manager your project names.
+- A harness whose `@deepseek-ai/*` line matches the peers in `package.json`
+  (currently `0.2.0-rc.2`). They are pinned on purpose: the plugin builds against
+  the types of one harness line.
 
 ## Development
 
 ```powershell
-python -m pip install -r requirements-dev.txt
-python tests/test_toolhub.py        # 171 tests, standard-library unittest
-ruff check . ; ruff format --check .
-pyright scripts tests
+pnpm install
+pnpm typecheck      # host, client and test programs
+pnpm build          # both halves: lib/index.js and lib/client.js
+pnpm test           # vitest
 ```
 
-CI runs the same three things on `windows-latest`, against Python 3.11 / 3.13 /
-3.14.
+The engine under `src/engine/` is pure logic ported from the retired server with
+its test suite — the digest parsers, the known-failure split, the command
+surface, the ARB editor, the resolvers. Its specs read the same fixtures the
+Python suite did (`tests/fixtures/`), and the ports were checked against the
+Python outcomes: `validate.ts` has a 135-case parity digest whose
+Python-vs-TypeScript output hashes identical.
 
-## Why not a DSH plugin?
+Two sandbox facts shape the loop, both measured:
 
-DSH plugins run *inside* the harness process: Node/ESM packages installed with
-`dsh plugin add`, loaded through the harness's own bundle and slot machinery. This
-does the opposite — it runs *beside* the harness, as an ordinary background
-process, precisely because its job is to touch the very toolchain the harness's
-file sandbox denies, and it must not be subject to that sandbox itself. That is
-why it ships as a skill plus a script rather than as a plugin package.
+- **Run the suite through the toolchain bridge, not directly,** in a confined
+  session: `vitest` loads its config through esbuild's service, which spawns with
+  piped stdio and dies with `spawn EPERM` under the sandbox. Outside a sandbox,
+  or through the plugin's own `bridge_run`, it runs normally.
+- **`--pool=threads`** keeps vitest portable between the two: its default forks
+  pool uses an IPC pipe, and pipes are what the sandbox forbids.
+
+## Where the rest lives
+
+- `CONTEXT.md` — the vocabulary the code and the docs are written in: tool
+  bridge, engine, the two halves, switch, scoped mount, job ledger, lane depth,
+  working directory, guardrail, digest, format pin, uncommitted scope, sight —
+  plus the terms this refactor retired and why.
+- `docs/adr/` — the decisions: the allowlist is a guardrail (0001, amended for the
+  trust decision); the working directory is fixed (0002); a sub-tool is a job
+  (0003, amended); the Node surface and the long lane (0004); the browser belongs
+  to Playwright MCP, now mounted per conversation (0005, amended); npm is a
+  package manager on the same terms (0006); **the plugin is the bridge** (0007).
+- `docs/vite-vitest-sandbox-findings.md` — the measurements behind the Node
+  surface: which commands the sandbox kills, with what error, and why.
+- `src/engine/` — the pure logic and the reason each refusal exists.
+- `src/host/` — the plugin half: tools, lanes, the job ledger, the switches,
+  the scoped browser mount, the sidebar's transport.
+- `src/client/` — the browser half: the switch row above the composer and the sidebar panel.
 
 ## Deliberately absent
 
-- `git push` (the GitHub token must never live in a long-running process), git
-  history rewriting (`reset --hard`, `rebase`), whole-worktree wipes (`clean`,
-  `git restore .`), `stash`, and `checkout`/`switch` in every form.
-- An accepted executable name for arbitrary commands — see the security model
-  above; `dart` already reaches arbitrary code.
-- The unnarrowed package-manager forms: `pnpm dlx`, `npm link`/`unlink`,
-  `publish`, `config`/`store`, and an **Exec form** target that is not one of the
-  project's own script binaries (`npx <anything>` included). `npx` itself is
-  accepted, but only in that narrowed shape (ADR-0006).
-- Guessing a project's package manager from its lockfile: the lockfile is
-  advisory, the caller names the manager, and a fork carrying both lockfiles is
-  the case that motivated admitting npm at all (ADR-0006).
-- UI driving in the bridge: the browser belongs to `@playwright/mcp` through
-  `@deepseek-ai/dsh-mcp-client`, not to this server (ADR-0005). The bridge runs
-  the app under test; the browser drives it. The reason is the maintained tool
-  surface — an accessibility snapshot with element refs, auto-waiting, uploads,
-  dialogs, console, network and video — not the pictures: the harness already
-  reads a local screenshot, so a path is sight too. `SKILL.md` section 7 is the
-  loop.
-- Per-job `cwd` and worktree-per-baseline entries (ADR-0002), detached mode across
-  sessions, and build-cache copying between worktrees (CMake/ninja state is
-  path-keyed, while the genuinely expensive caches — pub cache, SDK artifacts —
-  are already machine-global).
-- A queue-aware early return from `/run`: `wait:false` already expresses it, and
-  returning `queued` whenever the queue is non-empty would force polling for the
-  common case.
-- A per-request formatter or SDK override, and a scope for anything but
-  `dart format` (an expansion), `dart`/`flutter` `analyze` and `fix` (a filter).
-  The pin is boot-scoped, like the pinned cwd; a request that could retarget the
-  toolchain would only be a slower way to format with the wrong dart.
+`git push`; git history rewriting (`reset --hard`, `rebase`); whole-worktree
+wipes (`clean`, `git restore .`); `stash`; `checkout`/`switch`; a per-request
+`cwd` (the working directory is the session's, ADR-0002) and per-request
+worktrees; the unnarrowed package-manager forms (`pnpm dlx`,
+`npm link`/`unlink`/`publish`/`config`/`store`) and an exec-form target that is
+not a project script binary; guessing a project's package manager from its
+lockfile (the lockfile is advisory, the caller names the manager); any raw `node`
+or `python` executable name (the guardrail is a list of names, ADR-0001); a
+per-request formatter override (the pin is configuration); UI driving inside the
+plugin — the browser is Playwright MCP's, mounted per conversation (ADR-0005).
 
 ## Licence
 

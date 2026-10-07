@@ -1,30 +1,17 @@
-__pycache__/
-*.pyc
-*.pyo
-
-# Scratch directory for the confined smoke test (see SKILL.md).
-.toolhub-smoke/
-
-# Scratch copy of the ARB fixture tree used by the arb-edit job tests.
-tests/.tmp-arbtool/
-tests/.tmp-arbtool-logs/
-
-# Scratch directories of the formatter-pin, scope and registry tests. The tests
-# remove these themselves; a crashed or interrupted run can leave one behind.
-tests/.tmp-format-pin/
-tests/.tmp-scope/
-tests/.tmp-scope-logs/
-tests/.tmp-registry/
-
-# Scratch trees of the Node-toolchain tests: a fake npm-shaped tree, a fake
-# project whose vite/vitest are Node scripts, and their job logs.
-tests/.tmp-node/
-tests/.tmp-node-project/
-tests/.tmp-node-logs/
-
-# Ruff's cache, created by `ruff check` in the repository root.
-.ruff_cache/
-
-# A pnpm store, which pnpm creates next to the workspace root whenever anything
-# installs here (inside the sandbox that is the only writable store location).
+node_modules/
+lib/
 .pnpm-store/
+coverage/
+*.tsbuildinfo
+
+# Scratch trees of the engine specs; a crashed or interrupted run can leave one
+# behind, and every other one the specs remove themselves.
+tests/.tmp-*/
+
+# Local runtime state: per-session toggle state and job logs when a spec or a
+# hand-run points the plugin at a directory inside the repository.
+.toolbridge/
+
+# Where the browser MCP writes a session's console log and page snapshots
+# when it is started in this directory; runtime output, never a source file.
+.playwright-mcp/

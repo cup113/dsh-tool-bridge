@@ -1,0 +1,25 @@
+# pnpm settings for this repository.
+#
+# nodeLinker: hoisted — the default `isolated` linker puts every transitive
+# dependency behind a Windows junction inside `node_modules/.pnpm`, and Node
+# then fails to resolve a real dependency of a tool invoked by path
+# (`node node_modules/vitest/vitest.mjs` → `Cannot find package '@vitest/utils'`),
+# which in the DSH sandbox is the only way to start a task runner at all
+# (`pnpm exec`/`pnpm run` trip over the sandbox's spawn boundary). A hoisted
+# tree resolves by ordinary lookup, and it is also the linker a DSH profile uses
+# when it installs this plugin, so the dev tree and the installed tree agree.
+nodeLinker: hoisted
+
+# pnpm 10's build-script allowlist lives here (this pnpm reads the `allowBuilds`
+# table, not the `pnpm` field in package.json).
+#
+# esbuild's install script is denied ON PURPOSE, and that is the sandbox-safe
+# setting rather than a compromise: esbuild's real binary ships in the
+# platform-specific optional dependency (@esbuild/win32-x64), so the postinstall
+# is unnecessary (`require('esbuild').version` already answers 0.25.12 without
+# it) — while approving it makes pnpm spawn the script with piped stdio, which
+# the DSH file sandbox denies with `spawn EPERM`. An explicit `false` is also
+# what keeps `pnpm install` from exiting 1 with ERR_PNPM_IGNORED_BUILDS: the
+# decision is recorded, so pnpm has nothing left to complain about.
+allowBuilds:
+  esbuild: false

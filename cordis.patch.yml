@@ -1,0 +1,16 @@
+# The tool-bridge layer: one row, the plugin itself.
+#
+# The plugin's own defaults come from its config schema; a machine-specific
+# value (the formatter pin, the Playwright output directory) belongs in the
+# PROFILE's `cordis.patch.yml` as an override row, because a patch replaces the
+# targeted row's whole `config`:
+#
+#   - id: toolbridge
+#     config:
+#       dartFormatExe: C:/Tools/dart-3.12.2/bin/dart.exe
+#       playwright:
+#         outputDir: C:/Users/me/AppData/Local/dsh-pw-mcp
+#
+- insert:
+    - id: toolbridge
+      name: '@cup113/dsh-plugin-toolbridge'

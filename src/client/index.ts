@@ -1,7 +1,7 @@
 /**
  * The browser half's entry point.
  *
- * Three registrations, and each one is a different kind of UI fact:
+ * Four registrations, and each one is a different kind of UI fact:
  *
  * - the switch row in `conversation.input.dock` — the framework's own "full-width
  *   entries above the composer card" seat, where the harness puts its todo panel
@@ -10,6 +10,9 @@
  *   to a full row of its own, aligned with the input card;
  * - a sidebar tab type plus its body, so the toolchain's state is one click away
  *   beside the conversation rather than in another window;
+ * - the tab chip's own seat (`sidebar.right.pane.tab.title`). A type's `title` is
+ *   only the text captured at open time; the chip itself is drawn there, and a
+ *   type that registers no entry there gets bare text and no glyph;
  * - a guide entry, so the tab is discoverable by someone who has not read this
  *   file.
  *
@@ -23,33 +26,32 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
+import { IconCodeOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 
 import { BridgePanel } from './BridgePanel'
 import { Switches } from './Switches'
+import { TabTitle } from './TabTitle'
+import { PANEL_KIND, openPanel } from './openPanel'
+import { CLIENT_SERVICES } from './services'
 
 /** The tab type's identity: a package name is the natural value. */
 const TAB_ID = '@cup113/dsh-plugin-toolbridge'
-/** The page kind, so the tab opens as `openTab('bridge')`. */
-const TAB_KIND = 'bridge'
 
-/** Services this half needs. */
-export const inject = ['sidebarRightTabs', 'slots']
-
-/**
- * Open the tool-bridge panel, tolerating the cases where it cannot be opened.
- *
- * `openTab` throws for a kind nothing registered and for a write with no mounted
- * Session surface, and a navigation shortcut is not worth failing a render over:
- * the row's switches keep working either way.
- * @param ctx - the client plugin's context.
- */
-function openPanel(ctx: Context): void {
-  try {
-    ctx.sidebarRight.openTab(TAB_KIND)
-  } catch (error) {
-    ctx.logger.warn(`toolbridge: could not open the panel tab: ${String(error)}`)
+declare module '@deepseek-ai/dsh-client-ui-sidebar-right/client' {
+  interface SidebarRightTabParamsMap {
+    /**
+     * The conversation whose panel is open.
+     *
+     * Carried rather than left to the body's own guess: the host can only infer a
+     * conversation when exactly one is live, so a panel opened beside a second
+     * window would have nothing to show.
+     */
+    bridge: { readonly sessionId: string }
   }
 }
+
+/** Services this half needs; every `ctx.<name>` it touches is listed there. */
+export const inject = [...CLIENT_SERVICES]
 
 /**
  * Mount the browser half.
@@ -60,7 +62,7 @@ export function apply(ctx: Context): void {
     () =>
       ctx.sidebarRightTabs.register({
         id: TAB_ID,
-        kind: TAB_KIND,
+        kind: PANEL_KIND,
         // A page type: it is opened by kind, not by a resource address, so it
         // claims no patterns and takes no `canOpen` veto.
         title: () => 'Tool bridge',
@@ -74,6 +76,8 @@ export function apply(ctx: Context): void {
             title: () => 'Tool bridge',
             description: () =>
               'Lane depth, jobs and logs for the Flutter/Dart and Node toolchains this conversation runs outside the file sandbox.',
+            // Without one the guide draws its cube placeholder.
+            icon: IconCodeOutlineRegular,
           },
         ],
       }),
@@ -86,6 +90,14 @@ export function apply(ctx: Context): void {
         ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TAB_ID }, BridgePanel),
       ),
     'toolbridge tab body',
+  )
+
+  ctx.effect(
+    () =>
+      ctx.slots.inject('sidebar.right.pane.tab.title', () =>
+        ctx.slots.register({ name: 'sidebar.right.pane.tab.title', key: TAB_ID }, TabTitle),
+      ),
+    'toolbridge tab chip',
   )
 
   ctx.effect(
@@ -103,7 +115,10 @@ export function apply(ctx: Context): void {
             // asking for the session id here is how a dock entry learns which
             // conversation it belongs to, and the panel's opener travels the same
             // way (the shell's own job list passes its service calls like this).
-            inject: (sessionId: string) => ({ sessionId, openPanel: () => openPanel(ctx) }),
+            inject: (sessionId: string) => ({
+              sessionId,
+              openPanel: () => openPanel(ctx.sidebarRight, sessionId),
+            }),
           },
           Switches,
         ),

@@ -18,10 +18,11 @@
  */
 
 import { useCallback, useEffect, useState } from 'react'
-import { Button, IconPanelLeftOutlineRegular, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
+import { Button, IconCodeOutlineRegular, Switch } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 
 import { fetchState, postToggle } from './api'
+import { danger, muted } from './theme'
 import type { SessionView } from './api'
 import type { ToggleState } from './types'
 
@@ -86,8 +87,15 @@ const switchStyle: React.CSSProperties = {
 }
 /** Pushes the panel shortcut to the row's far end. */
 const spacerStyle: React.CSSProperties = { marginLeft: 'auto' }
-const noteStyle: React.CSSProperties = { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' }
-const failureStyle: React.CSSProperties = { ...noteStyle, color: 'var(--dsw-alias-label-error)' }
+/**
+ * The row's status words.
+ *
+ * Both come from the shared vocabulary rather than from a token spelled here:
+ * `--dsw-alias-label-error`, which this row used to name, is defined nowhere in
+ * the theme, so the failure it coloured was never actually red.
+ */
+const noteStyle: React.CSSProperties = { fontSize: '12px', ...muted }
+const failureStyle: React.CSSProperties = { fontSize: '12px', ...danger }
 
 /** One switch with its visible name. */
 function Half({
@@ -197,7 +205,10 @@ export function Switches({ sessionId, openPanel }: SwitchesProps): React.ReactEl
         // switches. The panel is a way out of this row, not a third capability.
         variant="ghost"
         size="sm"
-        icon={<IconPanelLeftOutlineRegular />}
+        // The same glyph the panel's own tab chip draws, and a code one: the
+        // `panel` family draws a *left* column, which is not the column this
+        // opens.
+        icon={<IconCodeOutlineRegular />}
         aria-label="Open the tool-bridge panel"
         title="Open the tool-bridge panel: lanes, jobs, digests and logs for this conversation."
         onClick={() => openPanel()}

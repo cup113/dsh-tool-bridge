@@ -9,58 +9,69 @@
  * is, and what the current job is printing.
  *
  * The panel is deliberately read-only about the switches: they live in the
- * conversation header, and a capability switch duplicated in two places is a
- * switch that eventually disagrees with itself.
+ * conversation row above the composer, and a capability switch duplicated in two
+ * places is a switch that eventually disagrees with itself.
+ *
+ * Three layout rules are load-bearing:
+ *
+ * - **This panel IS the scroll region** (`panelFrame` carries the three
+ *   properties, with the measurement behind them). Since 0.2.0-rc the sidebar
+ *   clips every tab body in a fixed-height `overflow:hidden` flex container, so a
+ *   panel that does not scroll itself has no scroller anywhere in its subtree and
+ *   its content is simply cut off at the fold.
+ * - **The log also scrolls**, and caps its own height, so a chatty build cannot
+ *   push the job list out of reach even though the panel scrolls underneath it.
+ * - **Every colour, border and face comes from `./theme`**, which is one place
+ *   where the shell's design tokens are named — the same vocabulary the switch
+ *   row and the tab chip use.
  */
 
 import { useCallback, useEffect, useState } from 'react'
+import type { CSSProperties } from 'react'
+import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 
 import { fetchJob, fetchState } from './api'
 import type { PanelJob, SessionView } from './api'
+import { HAIRLINE, card, danger, dot, jobRow, logBody, mono, muted, panelFrame, pill, sectionTitle } from './theme'
 
-const panel: React.CSSProperties = {
+/** The panel's own frame: a stack of blocks, monospace, and the subtree's scroller. */
+const panel = panelFrame
+
+/** A row of capsules, wrapping on a narrow sidebar. */
+const pillRow: CSSProperties = { display: 'flex', flexWrap: 'wrap', gap: '4px' }
+
+/** A card whose children run edge to edge, so hairline separators span it. */
+const flushCard: CSSProperties = { ...card, padding: 0, gap: 0, overflow: 'hidden' }
+
+/** The left column of a job row: the dot. */
+const dotColumn: CSSProperties = { paddingTop: '7px' }
+
+/** The right column of a job row: argv, then the facts, then the summary. */
+const jobText: CSSProperties = { display: 'flex', flexDirection: 'column', gap: '1px', minWidth: 0, flex: 1 }
+
+/** The log's banner: the argv the tail belongs to, and the job's state. */
+const logBanner: CSSProperties = {
   display: 'flex',
-  flexDirection: 'column',
-  gap: '10px',
-  fontSize: '12px',
-  lineHeight: '18px',
-  padding: '10px',
-}
-
-const sectionTitle: React.CSSProperties = {
+  alignItems: 'baseline',
+  gap: '8px',
+  padding: '6px 10px',
+  borderBottom: HAIRLINE,
+  color: 'var(--dsw-alias-label-tertiary)',
+  fontFamily: mono.fontFamily,
   fontSize: '11px',
-  fontWeight: 600,
-  letterSpacing: '0.04em',
-  opacity: 0.6,
-  textTransform: 'uppercase',
 }
 
-const factRow: React.CSSProperties = { display: 'flex', gap: '6px', opacity: 0.85 }
-const jobRow = (selected: boolean): React.CSSProperties => ({
-  border: '1px solid currentColor',
-  borderRadius: '6px',
-  cursor: 'pointer',
-  opacity: selected ? 1 : 0.75,
-  padding: '6px 8px',
-  textAlign: 'left',
-  width: '100%',
-  background: 'transparent',
-  color: 'inherit',
-  font: 'inherit',
-})
-
-const tailBox: React.CSSProperties = {
-  border: '1px solid currentColor',
-  borderRadius: '6px',
-  maxHeight: '320px',
-  opacity: 0.9,
-  overflow: 'auto',
-  padding: '6px 8px',
-  whiteSpace: 'pre-wrap',
-  wordBreak: 'break-all',
+/** The status dot's colour, by job state. */
+const DOT_COLOUR: Readonly<Record<string, string>> = {
+  queued: 'var(--dsw-alias-label-tertiary)',
+  running: 'var(--dsw-alias-label-secondary)',
+  done: 'var(--dsw-alias-label-tertiary)',
+  failed: 'var(--dsw-alias-state-error-primary)',
+  killed: 'var(--dsw-alias-state-error-primary)',
 }
 
-/** How one job reads at a glance. */
+/** How one job reads at a glance, beside its argv. */
 function jobLine(job: PanelJob): string {
   const parts = [job.status]
   if (job.lane === 'long') parts.push('long lane')
@@ -70,19 +81,24 @@ function jobLine(job: PanelJob): string {
   return parts.join(' · ')
 }
 
-/** Props the slot runtime passes to a tab body, plus the fallback we thread ourselves. */
-export interface BridgePanelProps {
-  /** The conversation, when the slot runtime supplies it. */
-  sessionId?: string
-  /** Framework-bound tab reader, present for a sidebar tab body. */
-  useTabInfo?: () => { tab?: { navigation?: { params?: unknown } }; actions?: { close?: () => void } }
+/** What the Browser capsule says: the switch's intent and the connection's fact, told apart. */
+function browserWord(view: SessionView): string {
+  if (view.browserMounted) return 'connected'
+  return view.toggles.browser ? 'starting' : 'off'
+}
+
+/** Where the formatter comes from, as one line. */
+function formatterLine(view: SessionView): string {
+  return view.config.dartFormatExe === null
+    ? 'formatter: PATH dart (no CI pin)'
+    : `formatter pin: ${view.config.dartFormatExe}`
 }
 
 /**
  * Render the panel.
- * @param props - slot props; the session id may arrive directly or through navigation params.
+ * @param props - the seat's runtime face; the conversation arrives as the tab's navigation parameter.
  */
-export function BridgePanel(props: BridgePanelProps): React.ReactElement {
+export function BridgePanel(props: PropsRuntime<'sidebar.right.pane.tab'>): React.ReactElement {
   const sessionId = resolveSessionId(props)
   const [view, setView] = useState<SessionView | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -101,6 +117,8 @@ export function BridgePanel(props: BridgePanelProps): React.ReactElement {
 
   useEffect(() => {
     void refresh()
+    // The browser half connects and the lanes move on their own; a slow poll
+    // keeps the panel honest without an event stream the host does not have.
     const timer = setInterval(() => void refresh(), 4000)
     return () => clearInterval(timer)
   }, [refresh])
@@ -130,79 +148,94 @@ export function BridgePanel(props: BridgePanelProps): React.ReactElement {
   }
 
   const jobs = view.jobs
+  const selectedJob = jobs.find((job) => job.id === selected) ?? null
+
   return (
     <div style={panel}>
-      <div>
-        <div style={sectionTitle}>Conversation</div>
-        <div style={factRow}>
-          <span>{view.cwd ?? 'no working directory yet'}</span>
+      <div style={card}>
+        <div style={{ wordBreak: 'break-all' }}>{view.cwd ?? 'no working directory yet'}</div>
+        <div style={pillRow}>
+          <span style={pill}>toolchain {view.toggles.bridge ? 'on' : 'off'}</span>
+          <span style={pill}>browser {browserWord(view)}</span>
         </div>
-        <div style={factRow}>
-          <span>Toolchain {view.toggles.bridge ? 'on' : 'off'}</span>
-          <span>·</span>
-          <span>Browser {view.browserMounted ? 'connected' : view.toggles.browser ? 'starting' : 'off'}</span>
+        {view.browserError === null ? null : (
+          <div style={danger} role="alert">
+            browser failed: {view.browserError}
+          </div>
+        )}
+        <div style={muted}>{formatterLine(view)}</div>
+        <div style={muted}>
+          browser: {view.config.playwright.browser} · caps {view.config.playwright.caps}
         </div>
       </div>
 
       <div>
         <div style={sectionTitle}>Lanes</div>
-        <div style={factRow}>
-          <span>queue {view.lanes.queue}</span>
-          <span>·</span>
-          <span>long {view.lanes.long}</span>
-        </div>
-        <div style={factRow}>
-          <span>
-            {view.config.dartFormatExe === null
-              ? 'formatter: PATH dart (no CI pin)'
-              : `formatter pin: ${view.config.dartFormatExe}`}
-          </span>
-        </div>
-        <div style={factRow}>
-          <span>
-            browser: {view.config.playwright.browser} · caps {view.config.playwright.caps}
-          </span>
+        <div style={{ ...pillRow, marginTop: '4px' }}>
+          <span style={pill}>queue {view.lanes.queue}</span>
+          <span style={pill}>long {view.lanes.long}</span>
         </div>
       </div>
 
       <div>
         <div style={sectionTitle}>Jobs ({jobs.length})</div>
         {jobs.length === 0 ? (
-          <div style={{ opacity: 0.7 }}>Nothing has run in this conversation yet.</div>
+          <div style={{ ...muted, marginTop: '4px' }}>Nothing has run in this conversation yet.</div>
         ) : (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
-            {[...jobs].reverse().map((job) => (
+          <div style={{ ...flushCard, marginTop: '4px' }}>
+            {[...jobs].reverse().map((job, index) => (
               <button
                 key={job.id}
                 type="button"
-                style={jobRow(job.id === selected)}
+                style={{
+                  ...jobRow(job.id === selected),
+                  ...(index === 0 ? {} : { borderTop: HAIRLINE }),
+                }}
                 onClick={() => setSelected(job.id === selected ? null : job.id)}
               >
-                <div>{jobLine(job)}</div>
-                <div style={{ opacity: 0.8, wordBreak: 'break-all' }}>{job.argv.join(' ')}</div>
-                {job.summary === null ? null : <div>{job.summary}</div>}
-                {job.error === null ? null : <div style={{ color: '#c0392b' }}>{job.error}</div>}
+                <span style={dotColumn}>
+                  {/* The status word is in the text below; the dot only colours it. */}
+                  <span style={dot(DOT_COLOUR[job.status] ?? 'var(--dsw-alias-label-secondary)')} aria-hidden />
+                </span>
+                <span style={jobText}>
+                  <span style={{ wordBreak: 'break-all' }}>{job.argv.join(' ')}</span>
+                  <span style={muted}>{jobLine(job)}</span>
+                  {job.summary === null ? null : <span style={muted}>{job.summary}</span>}
+                  {job.error === null ? null : <span style={danger}>{job.error}</span>}
+                </span>
               </button>
             ))}
           </div>
         )}
       </div>
 
-      {selected === null ? null : (
+      {selectedJob === null ? null : (
         <div>
           <div style={sectionTitle}>Log</div>
-          <div style={tailBox}>{tail === '' ? '(no output yet)' : tail}</div>
+          <div style={{ ...flushCard, marginTop: '4px' }}>
+            <div style={logBanner}>
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {selectedJob.argv.join(' ')}
+              </span>
+              <span style={{ marginLeft: 'auto', flex: 'none' }}>{jobLine(selectedJob)}</span>
+            </div>
+            <div style={logBody}>{tail === '' ? '(no output yet)' : tail}</div>
+          </div>
         </div>
       )}
     </div>
   )
 }
 
-/** The session id a tab body needs, from the props or the tab's navigation params. */
-function resolveSessionId(props: BridgePanelProps): string | undefined {
-  if (props.sessionId !== undefined && props.sessionId !== '') return props.sessionId
-  const params = props.useTabInfo?.().tab?.navigation?.params
-  if (typeof params === 'object' && params !== null) {
+/**
+ * The conversation a tab body answers for, from the tab's navigation parameters.
+ *
+ * The opener passes it (`openPanel`), so the panel never has to infer the
+ * conversation from "which session happens to be live".
+ */
+function resolveSessionId(props: PropsRuntime<'sidebar.right.pane.tab'>): string | undefined {
+  const params = props.useTabInfo().tab.navigation.params
+  if (typeof params === 'object' && params !== null && 'sessionId' in params) {
     const candidate = (params as { sessionId?: unknown }).sessionId
     if (typeof candidate === 'string' && candidate !== '') return candidate
   }

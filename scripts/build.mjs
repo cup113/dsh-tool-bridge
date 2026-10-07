@@ -2,9 +2,9 @@
 /**
  * Build both halves of the plugin.
  *
- * The esbuild NATIVE CLI with inherited stdio is used on purpose rather than
- * the JS API: the API derives the compiler as a child process over pipes, and
- * the DSH file sandbox denies the named pipes libuv needs for that
+ * The esbuild NATIVE CLI with inherited stdio is used on purpose rather than the
+ * JS API: the API derives the compiler as a child process over pipes, and the
+ * DSH file sandbox denies the named pipes libuv needs for that
  * (`spawn EPERM`). A build that only runs outside the session it serves is the
  * wrong build.
  *
@@ -76,20 +76,30 @@ rmSync(clientTmp, { force: true })
  *
  * Which seat the switches occupy is a decision, not an implementation detail: it
  * was moved out of the conversation header because that strip is cramped on a
- * phone. Asserting on the in-memory envelope rather than on the file matters —
- * a failed check must leave the previous artifact in place, not a tainted one
- * that a watcher would happily serve (`file:///…/scripts/build.mjs` learned this
- * the hard way during the guard's own drill).
+ * phone. The tab chip's seat is the same class of decision: a tab type's `title`
+ * is only text captured at open time, so a type that registers no entry in
+ * `sidebar.right.pane.tab.title` draws bare text where every shipped page draws
+ * its own glyph. Asserting on the in-memory envelope rather than on the file
+ * matters — a failed check must leave the previous artifact in place, not a
+ * tainted one that a watcher would happily serve (`file:///…/scripts/build.mjs`
+ * learned this the hard way during the guard's own drill).
  *
  * The check reads the *bundle text*, so it can only see strings that survive
  * bundling: registration names, labels, titles. That is exactly the class the
- * decision lives in — a comment saying otherwise would prove nothing.
+ * decision lives in — a comment saying otherwise would prove nothing. The inject
+ * set is deliberately NOT asserted here: `sidebarRight` also appears as
+ * `ctx.sidebarRight`, so a text search proves nothing about the list, and the
+ * service/inject correspondence is a test's job (`tests/client-inject.spec.ts`).
  */
-const expected = ['conversation.input.dock', 'sidebar.right.pane.tab']
+const expected = [
+  ['conversation.input.dock', 'the switches would be unreachable'],
+  ['sidebar.right.pane.tab', 'the panel would have no body'],
+  ['sidebar.right.pane.tab.title', 'the tab chip would draw bare text and no glyph'],
+]
 const forbidden = ['conversation.session.header.actions']
-for (const needle of expected) {
+for (const [needle, why] of expected) {
   if (!envelope.includes(needle)) {
-    throw new Error(`client bundle does not register ${needle}: the switches would be unreachable`)
+    throw new Error(`client bundle does not register ${needle}: ${why}`)
   }
 }
 for (const needle of forbidden) {
@@ -99,6 +109,4 @@ for (const needle of forbidden) {
 }
 
 writeFileSync(join(root, 'lib', 'client.js'), envelope)
-console.log(`client bundle registers ${expected.join(', ')}`)
-
-
+console.log(`client bundle registers ${expected.map(([needle]) => needle).join(', ')}`)

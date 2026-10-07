@@ -192,9 +192,15 @@ export class SessionSwitches {
     // connection, so a later switch-on starts from a clean row.
     this.browserErrors.delete(sessionId)
     const applied = this.applied.get(sessionId)
-    if (applied?.unmountBrowser === undefined) return
+    if (applied === undefined) return
+    const unmount = applied.unmountBrowser
+    if (unmount === undefined) return
+    // Hold the disposer in a local before clearing the slot. Reading it back off
+    // the record after clearing it yields `undefined`, and awaiting that calls
+    // nothing at all: the connection and its browser outlive the switch-off, and
+    // the panel reports a mount that is still there as gone.
     applied.unmountBrowser = undefined
-    await applied.unmountBrowser
+    await unmount()
   }
 
   private async detach(sessionId: string): Promise<void> {

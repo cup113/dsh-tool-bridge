@@ -69,7 +69,12 @@ Long jobs therefore run on a second lane, serialized among themselves.
   and the lane never moved again. The handle `Popen` already owns terminates the
   process instead — and the same fallback covers the window where a job is killed
   after it is marked running but before that handle exists. A refused kill is now
-  reported as `TOOLHUB KILL`, never silent.
+  reported as `TOOLHUB KILL`, never silent. **Superseded in part by
+  [ADR-0008](./0008-a-kill-ends-the-whole-tree.md)**: the measurement above is
+  about the *retired server*, which was itself a sandboxed process. The plugin
+  runs in the host process instead, so `taskkill /T` is no longer refused, and it
+  is now the primary kill — with the owned handle kept, exactly as this ADR
+  established, as the fallback for when the sweep is refused, missing or slow.
 - Vite 7 and earlier stay unusable *inside* the sandbox even with a `net use`
   shim, because esbuild must spawn a binary and that spawn cannot be stubbed. That
   is the bridge's reason to exist for those projects, not a gap to engineer

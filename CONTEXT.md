@@ -186,6 +186,26 @@ The second worker line, serialized among **Long jobs** only. The guess
 symmetric.
 _Avoid_: dev lane, watch lane, second queue
 
+**Tree sweep**:
+`taskkill /T /F` on a **Job**'s root, ending the descendants a single-process kill
+would leave behind — `flutter test`'s `flutter_tester.exe` children, a forked
+vitest worker, esbuild's service. It runs *before* the **Owned kill**, because it
+walks the parent-child chain and resolves that pid only when the helper runs; a
+root ended first leaves it nothing to walk. It is available because the plugin
+runs in the host process, outside the file sandbox, which is the same property
+that lets a **Job** write into `build/` (ADR-0008).
+_Avoid_: tree kill (that is the umbrella; the sweep is the helper), `taskkill`
+(the executable, not the step), process group (that is the POSIX idea the sweep
+deliberately does not implement)
+
+**Owned kill**:
+`child.kill()` on the process a run itself started — the fallback that ends the
+direct child when the **Tree sweep** is refused, missing or slow, and the only
+kill there is for a pid-less child. ADR-0004's finding, still standing: a kill
+that is merely a fresh process asking for access can be refused while the target
+is alive.
+_Avoid_: hard kill, fallback kill
+
 **Plan phase**:
 The stage that computes every target file's new content before any file is
 written, so a semantic error (a missing anchor) leaves the whole set untouched.
@@ -451,7 +471,7 @@ completion notices are the same either way.
 - "`npm exec` and `npx` are different things" — resolved: `npx` *is* `npm exec` with the package named implicitly, so both are **Exec forms** with the same narrowing; the difference is only that `npx` names the tool as its first argument.
 - "npm/npx were deliberate non-goals" — resolved: that stood only while no project needed them. Both are accepted now; what stays a non-goal is the *unnarrowed* form — `npx <anything>`, `npm link`/`publish`/`config`, and any cwd-retargeting flag.
 - "the sandbox denies `vite` because of a file" — resolved: the sandbox denies **pipes**. `spawn`/`exec`/`fork` with piped stdio throw `EPERM` (no named pipes), while `inherit`, a file fd, `worker_threads` and loopback TCP all work; that single mechanism explains Vite's `net use` probe, vitest's default forks pool and esbuild's service spawn (ADR-0004).
-- "killing a job is just `taskkill`" — resolved: it is not, under this sandbox. `taskkill /F /T` answers "access denied" while the target is alive, so the fallback to the owned process handle is part of the **Long job** feature rather than a detail: without it a killed dev server kept running *and* held its lane.
+- "killing a job is just `taskkill`" — resolved: it is both, in a fixed order, and the order is the mechanism (ADR-0008). The **tree sweep** (`taskkill /T /F`, resolved to `%SystemRoot%\System32`) runs first, because it walks the parent-child chain from the root and resolves that pid only when the helper runs — a root ended first leaves the walk nothing to walk, measured as `taskkill exited 128: process not found` with every descendant missed. The **owned handle** then ends the process the run started, and is what makes the kill survive a sweep that is refused, missing or slow: this half is ADR-0004's finding, taken under the retired server's own sandbox, and it still stands. Without the sweep a killed `flutter test` left `flutter_tester.exe` children holding `build\native_assets\windows\sqlite3.dll` mapped for over an hour, and every later run in that project died deleting it.
 - "让模型操纵浏览器进行测试" / "let the model test the UI" — resolved: two different capabilities. A **UI walkthrough** is exploratory live driving, and that is the one the plugin supplies through its browser half; a script-driven E2E run is a **Job** that already works through `bridge_run` (`pnpm run <e2e script>`, `flutter test integration_test -d windows`).
 - "the browser runs in the toolchain half" — resolved: false by construction. The browser is an MCP server spawned over stdio by the **Scoped mount**, and the **Allowlist** — a **Guardrail**, not a boundary — does not reach it.
 - "an always-on MCP server" — resolved: there is none. No server process and no schema exists until a conversation's **Switch** mounts one, and that mount is disposed with the switch or the conversation.

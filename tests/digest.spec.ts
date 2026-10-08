@@ -92,6 +92,9 @@ describe('analyzeTestLog: counts authoritative, failures complete, run order', (
   })
 
   it('keeps everything for the failures-only reporter, which has no block', () => {
+    // The fixture carries this reporter's real shape — every progress line bare,
+    // without the `HH:MM` prefix the other reporters write — so this case fails
+    // if the reader ever anchors on the timestamp again.
     const result = digest('failures_only_failed.txt')
     expect(result.counts?.failed).toBe(2)
     expect(result.summary).toBe('12 passed, 2 failed')
@@ -314,20 +317,80 @@ describe('a coloured log digests exactly like a plain one', () => {
 })
 
 /**
+ * The `failures-only` reporter, whose shape is not the one the fixtures carry.
+ *
+ * `failures-only` writes **every** progress line without the `HH:MM` prefix —
+ * measured on a real 2 503-line job log: 0 prefixed progress lines, 240 bare
+ * ones, and the run's last line `+7430 ~49 -8: Some tests failed.` while the job
+ * exited 1. Every `package:test` pattern was anchored on the timestamp, so the
+ * digest got no counts and no failure inventory from it at all, and then read
+ * that same last line as a terminal marker and announced **"all tests passed"**
+ * — a false success for a failed run, which a panel screenshot caught.
+ *
+ * Both halves are fixed together because either one alone still lies: without the
+ * bare form the counts are missing, and without the marker's polarity the missing
+ * counts are reported as a pass.
+ */
+describe('a failures-only run is read for what it is', () => {
+  it('recovers the counts and the inventory from a bare progress line', () => {
+    const log = scratchLog(
+      'failures-only.txt',
+      '+284: D:/ws/test/a_test.dart: a test that passed\n' +
+        '+570 -1: D:/ws/test/b_test.dart: imported IDs cannot escape the private directory [E]\n' +
+        '+7430 ~49 -8: Some tests failed.\n',
+    )
+    const result = analyzeTestLog(FLUTTER_TEST, log)
+    expect(result.counts).toEqual({ passed: 7430, skipped: 49, failed: 8 })
+    expect(result.summary).toBe('7430 passed, 8 failed')
+    expect(result.failures).toHaveLength(1)
+    expect(result.failures[0]?.file).toBe('D:/ws/test/b_test.dart')
+    expect(result.failures[0]?.name).toBe('imported IDs cannot escape the private directory')
+  })
+
+  it('never reads the failure marker as a pass', () => {
+    // Counts are absent and the marker says the suite failed: the only honest
+    // answer is the one that claims nothing.
+    const log = scratchLog('marker-only.txt', 'Some tests failed.\n')
+    const result = analyzeTestLog(FLUTTER_TEST, log)
+    expect(result.counts).toBeNull()
+    expect(result.summary).toBe('see log')
+  })
+
+  it('still trusts a success marker that carries no counts', () => {
+    // The one case where a claim is evidence-backed: the reporter itself said so.
+    const log = scratchLog('all-passed.txt', 'All tests passed!\n')
+    expect(analyzeTestLog(FLUTTER_TEST, log).summary).toBe('all tests passed')
+  })
+
+  it('does not claim a pass when the marker reports failures the counts missed', () => {
+    const log = scratchLog('suites.txt', '+12: D:/ws/test/a_test.dart: a test\nSome tests failed.\n')
+    const result = analyzeTestLog(FLUTTER_TEST, log)
+    expect(result.counts).toEqual({ passed: 12, skipped: 0, failed: 0 })
+    expect(result.summary).toBe('see log')
+  })
+})
+
+/**
  * The Python suite exercises these only through `analyze_test_log`, so its
  * branches no fixture reaches (a terminal run with no counts, the orphan path
  * of `attach_paths`, the `skipped` suffix) are pinned here directly from the
  * ported bodies.
  */
 describe('digest primitives', () => {
-  it('summarizes counts, terminal markers and their absence', () => {
-    expect(summarizeTestRun(null, true)).toBe('all tests passed')
-    expect(summarizeTestRun(null, false)).toBe('see log')
-    expect(summarizeTestRun({ passed: 3, skipped: 0, failed: 2 }, true)).toBe('3 passed, 2 failed')
-    expect(summarizeTestRun({ passed: 3, skipped: 0, failed: 2 }, false)).toBe('3 passed, 2 failed')
-    expect(summarizeTestRun({ passed: 3, skipped: 0, failed: 0 }, true)).toBe('3 passed')
-    expect(summarizeTestRun({ passed: 3, skipped: 2, failed: 0 }, true)).toBe('3 passed, 2 skipped')
-    expect(summarizeTestRun({ passed: 3, skipped: 1, failed: 0 }, false)).toBe('see log')
+  it('summarizes counts, a suite verdict, and their absence', () => {
+    // A verdict, not a boolean: the marker set carries both "All tests passed!"
+    // and "Some tests failed.", and reading the second as the first is how a
+    // failed run came to be summarized as a pass.
+    expect(summarizeTestRun(null, 'passed')).toBe('all tests passed')
+    expect(summarizeTestRun(null, 'failed')).toBe('see log')
+    expect(summarizeTestRun(null, 'unfinished')).toBe('see log')
+    expect(summarizeTestRun({ passed: 3, skipped: 0, failed: 2 }, 'failed')).toBe('3 passed, 2 failed')
+    expect(summarizeTestRun({ passed: 3, skipped: 0, failed: 2 }, 'unfinished')).toBe('3 passed, 2 failed')
+    expect(summarizeTestRun({ passed: 3, skipped: 0, failed: 0 }, 'passed')).toBe('3 passed')
+    expect(summarizeTestRun({ passed: 3, skipped: 2, failed: 0 }, 'passed')).toBe('3 passed, 2 skipped')
+    expect(summarizeTestRun({ passed: 3, skipped: 1, failed: 0 }, 'unfinished')).toBe('see log')
+    // The reporter's own verdict wins over counts that show no failures.
+    expect(summarizeTestRun({ passed: 3, skipped: 0, failed: 0 }, 'failed')).toBe('see log')
   })
 
   it('splits a block entry, keeping the did-not-complete suffix out of the name', () => {

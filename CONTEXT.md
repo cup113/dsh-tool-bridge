@@ -243,12 +243,25 @@ _Avoid_: runner, kind, framework (a job is a `cmd` or an `arb-edit`; this is abo
 
 **Counts**:
 `passed`/`skipped`/`failed` read from the last `+N ~S -K:` progress line; the
-authoritative total.
+authoritative total. The line is read with or without a `HH:MM` prefix, because
+the `failures-only` reporter writes every one of its progress lines bare
+(ADR-0011).
 _Avoid_: totals, stats, "the numbers in the summary"
+
+**Suite verdict**:
+What the runner's own last word about the run was — `passed` (`All tests
+passed!`, `All other tests passed!`, `All tests skipped.`), `failed` (`Some tests
+failed.`), or `unfinished` when it said nothing. Three values, not a flag: the
+markers point in two directions, and a summary that read any of them as "the suite
+finished" called a failed run a pass (ADR-0011).
+_Avoid_: terminal marker (that is the line, not its meaning), exit code (that is
+the Job's, and a killed run has none)
 
 **Failure inventory**:
 The per-test failure list taken from `[E]` progress lines, in run order, with a
-suite path filled in from the block when one is available.
+suite path filled in from the block when one is available. Present for a
+`failures-only` run too — that is the reporter it matters most for, and its bare
+`[E]` lines were once dropped wholesale (ADR-0011).
 _Avoid_: failure list (ambiguous — see the block), errors
 
 **`Failing tests:` block**:
@@ -481,6 +494,7 @@ kept under that term.
 completion notices are the same either way.
 - "`job_output` shows a bridge job's output" — it did not, and every read of a bridge job returned `(no new output)` whatever the job did: the tool's output went to its own log file while `job_output` reads the harness's output ring, and nothing wrote to that ring. Fixed by the **Log mirror** (ADR-0009). The failure was silent by construction — a well-formed empty answer for a job that passed, failed, was still running or had settled — which is why it survived a session's worth of use.
 - "the log has no colour, because a job has no TTY" — it has colour, and the assumption cost the **Digest** a whole green suite: vitest's reporter colours a pipe on Windows, and the `^`-anchored vitest patterns matched nothing. Resolved by **Plain text** — overrides plus a strip at every read (ADR-0010); the assertion is now measured rather than assumed, and the log file still keeps its raw bytes.
+- "the summary says `all tests passed`, so the suite passed" — it said that for a run that failed and exited 1, because a terminal marker was treated as one flag when the markers point in two directions, and because `--reporter=failures-only` writes its progress lines without the `HH:MM` prefix the reader required — so the run had no counts to contradict the claim, and its whole **Failure inventory** went unread as well. Resolved by the **Suite verdict** and by reading both progress-line shapes (ADR-0011). A digest and a Job's exit code are independent readings on purpose: this was caught by the two disagreeing.
 - "the job's output ring is the plugin's" — resolved: it is the harness's, the plugin only supplies a **Log mirror** source, and the registry owns the read cadence. That split is what made the bug look like the harness's for as long as it did.
 - "a timed-out `bridge_run` killed my job" — resolved: it did not. Expiry returns the **Job** as it stands (`queued`/`running`, with `aheadOf`) and nothing is killed; read it on with `job_output`.
 - "a browser tool is a **Job** because the plugin hosts it" — resolved: it is not. It creates no **Job**, appears in no **Lane**, has no log and no **Digest**; it belongs to the **Scoped mount**.

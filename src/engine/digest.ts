@@ -17,20 +17,37 @@ import type { TestCounts, TestFailure, TestLogDigest } from './types'
 
 /* ------------------------------------------------------- package:test lines */
 
-/** A `package:test` progress line: "00:25 +67 ~2 -4: <description>". */
-const TEST_COUNTS_RE = /^\d\d:\d\d \+(\d+)(?: ~(\d+))?(?: -(\d+))?: /
+/*
+ * A `package:test` progress line, with or without the reporter's timestamp:
+ *
+ *     00:25 +67 ~2 -4: <description>
+ *     +7430 ~49 -8: Some tests failed.
+ *
+ * The second form is not a variant to tolerate, it is the only form
+ * `--reporter=failures-only` ever writes — measured on a real job log: 0
+ * timestamped progress lines and 240 bare ones, ending in exactly that line while
+ * the run exited 1. Anchoring on the timestamp cost the digest the counts *and*
+ * the whole failure inventory of every failures-only run.
+ */
+const TEST_COUNTS_RE = /^(?:\d\d:\d\d )?\+(\d+)(?: ~(\d+))?(?: -(\d+))?: /
 /** A failing test's progress line, with the `[E]` marker the reporters append. */
 const TEST_FAILURE_RE =
-  /^\d\d:\d\d \+\d+(?: ~\d+)?(?: -\d+)?: (?<name>.+?)(?<unfinished> - did not complete)? \[E\]$/
+  /^(?:\d\d:\d\d )?\+(\d+)(?: ~\d+)?(?: -\d+)?: (?<name>.+?)(?<unfinished> - did not complete)? \[E\]$/
 const TEST_BLOCK_HEADER = 'Failing tests:'
 const TEST_BLOCK_MORE_RE = /^\.\.\. and (\d+) more$/
 const TEST_DID_NOT_COMPLETE = ' (did not complete)'
-const TEST_TERMINAL_MARKERS: readonly string[] = [
+/*
+ * The reporter's last word about a run, and it has two directions. `terminal`
+ * used to be one boolean over both sets, which made "Some tests failed." set the
+ * same flag as "All tests passed!" — and a run whose counts were missing was then
+ * summarized as *"all tests passed"* while its job exited 1.
+ */
+const TEST_PASSED_MARKERS: readonly string[] = [
   'All tests passed!',
   'All other tests passed!',
   'All tests skipped.',
-  'Some tests failed.',
 ]
+const TEST_FAILED_MARKERS: readonly string[] = ['Some tests failed.']
 
 /* ------------------------------------------------------------ vitest lines */
 
@@ -141,16 +158,35 @@ export function attachPaths(failures: TestFailure[], block: TestFailure[]): Test
 }
 
 /**
+ * What the runner's own last word was, when it had one.
+ *
+ * Three values rather than a boolean because "the log ends with a terminal
+ * marker" is not a verdict: the markers come in both directions, and a summary
+ * built by collapsing them claimed success for a run the reporter had just
+ * called failed.
+ */
+export type SuiteVerdict = 'passed' | 'failed' | 'unfinished'
+
+/**
  * The one-line digest, kept deliberately close to the old wording.
  *
- * A missing terminal marker means the run was killed or truncated mid-suite;
- * "+N so far" would read as a finished suite, so that case stays opaque.
+ * Nothing here may invent a pass. The claim "all tests passed" is made in exactly
+ * one place — no counts at all, and a *success* marker to back it — because that
+ * is the one case where the reporter's own sentence is the evidence. A missing
+ * terminal marker means the run was killed or truncated mid-suite, and
+ * "+N so far" would read as a finished suite, so that case stays opaque; so does
+ * a failure marker whose counts show no failures, which is a suite that died
+ * before it counted anything.
+ * @param counts - the last progress line's totals, or null when there was none.
+ * @param verdict - what the runner said about the suite as a whole.
+ * @returns the one-line summary.
  */
-export function summarizeTestRun(counts: TestCounts | null, terminal: boolean): string {
-  if (counts === null) return terminal ? 'all tests passed' : 'see log'
+export function summarizeTestRun(counts: TestCounts | null, verdict: SuiteVerdict): string {
+  if (counts === null) return verdict === 'passed' ? 'all tests passed' : 'see log'
   const { passed, failed, skipped } = counts
   if (failed) return `${passed} passed, ${failed} failed`
-  if (!terminal) return 'see log'
+  if (verdict === 'failed') return 'see log'
+  if (verdict === 'unfinished') return 'see log'
   return `${passed} passed` + (skipped ? `, ${skipped} skipped` : '')
 }
 
@@ -175,7 +211,7 @@ export function parseFlutterLog(logPath: string): TestLogDigest {
   const failures: TestFailure[] = []
   const block: TestFailure[] = []
   let counts: TestCounts | null = null
-  let terminal = false
+  let verdict: SuiteVerdict = 'unfinished'
   let inBlock = false
   const lines = readLogLines(logPath)
   if (lines === undefined) return result
@@ -217,12 +253,13 @@ export function parseFlutterLog(logPath: string): TestLogDigest {
     }
     // Checked last and without `continue`: the terminal markers ride on the
     // very progress lines that carry the final counts.
-    if (TEST_TERMINAL_MARKERS.some((marker) => line.includes(marker))) terminal = true
+    if (TEST_PASSED_MARKERS.some((marker) => line.includes(marker))) verdict = 'passed'
+    else if (TEST_FAILED_MARKERS.some((marker) => line.includes(marker))) verdict = 'failed'
   }
 
   result.failures = attachPaths(failures, block)
   result.counts = counts
-  result.summary = summarizeTestRun(counts, terminal)
+  result.summary = summarizeTestRun(counts, verdict)
   return result
 }
 
@@ -337,8 +374,10 @@ export function parseVitestLog(logPath: string): TestLogDigest {
   result.failures = failures
   result.counts = counts
   // The summary line is the run's last output, so seeing it *is* reaching the
-  // end: a killed vitest run never writes one.
-  result.summary = summarizeTestRun(counts, counts !== null)
+  // end: a killed vitest run never writes one. Vitest reports failures inside
+  // that line rather than in a separate marker, so a run that wrote one and
+  // counted no failures really did pass.
+  result.summary = summarizeTestRun(counts, counts === null ? 'unfinished' : 'passed')
   return result
 }
 

@@ -30,7 +30,7 @@ import { wantsLongLane } from '../engine/resolve'
 import { pathFilterRegex, scopeMode, scopeRefusal, uncommittedDartFiles } from '../engine/scope'
 import { LANE_LONG, LANE_QUEUE, SCOPE_UNCOMMITTED } from '../engine/surface'
 import type { BaselineReport, JobStatus, Lane, TestCounts, TestFailure } from '../engine/types'
-import { validate } from '../engine/validate'
+import { buildArgv, validate } from '../engine/validate'
 import { logMirror } from './jobsource'
 import { clampTail, readFiltered } from './logfile'
 import type { LogView } from './logfile'
@@ -174,7 +174,15 @@ export class BridgeEngine {
    * @returns the job's initial view, with its id and its place in line.
    */
   async submitCommand(request: SubmitCommandRequest, agent: Agent): Promise<BridgeJobView> {
-    const argv = [request.cmd, ...request.args]
+    // The message is folded in **before** validation, because it *is* argv
+    // (`-m <text>`): the guardrail's `git commit` message rule reads the argv that
+    // will run, and it cannot see a field that is folded in afterwards. That was
+    // the live defect — `bridge_run {cmd: 'git', args: ['commit'], message: …}`
+    // was refused for having no message — while the fold that did exist ran later
+    // and appended `-m` to *any* command, so a stray message corrupted a
+    // `flutter test` argv instead of being refused. `buildArgv` is the function
+    // the port already had for this, guards and all, and it was never called.
+    const argv = buildArgv(request.cmd, request.args, request.message ?? null)
     // Normalises `npm test` into `npm run test` in place, before anything reads
     // the argv: the lane guess, the job JSON and the digest must agree.
     validate(argv)
@@ -206,7 +214,7 @@ export class BridgeEngine {
       }
     }
 
-    const plan = planRun({ cmd, args, message: request.message ?? null }, cwd, this.options.dartFormatExe)
+    const plan = planRun({ cmd, args }, cwd, this.options.dartFormatExe)
     const lane: Lane = (request.long ?? wantsLongLane(cmd, args)) ? LANE_LONG : LANE_QUEUE
     return this.register({
       owner: agent.id,

@@ -324,7 +324,7 @@ export function registerBridgeTools(ctx: Context, engine: BridgeEngine, config: 
         message: {
           type: 'string',
           description:
-            'A commit message for `git commit`, folded in as `-m <text>`. No file is ever created for it, so a later `git add -A` cannot sweep it into a commit.',
+            'A commit message for `git commit`, folded in as `-m <text>`. No file is ever created for it, so a later `git add -A` cannot sweep it into a commit. Refused for every other command, and refused alongside an `-m`/`-F`/`-C` the argv already carries.',
         },
         scope: {
           type: 'string',

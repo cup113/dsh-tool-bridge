@@ -149,3 +149,57 @@ describe('a command job mirrors its log into the job output ring', () => {
     expect(specs[0]?.output ?? []).toEqual([])
   })
 })
+
+/**
+ * The inline `message`, which the tool advertises and the guardrail refused.
+ *
+ * `submitCommand` built its argv by hand and let `planRun` fold the message in
+ * afterwards, so the `git commit` message rule — which reads that argv — could
+ * never see it, and `bridge_run {cmd: 'git', args: ['commit'], message: …}` was
+ * refused for carrying no message. Meanwhile the fold that did run appended `-m`
+ * to *any* command. `buildArgv` is the ported function that does this properly,
+ * with guards of its own, and it had no caller in production code; these cases
+ * exist so the live path stays on it.
+ */
+describe('an inline commit message reaches the argv, and only where it belongs', () => {
+  function engineWith(specs: JobSpec[]): BridgeEngine {
+    return new BridgeEngine({ jobs: recordingJobs(specs) } as unknown as Context, new Lanes(), {
+      logDir: LOGS,
+      dartFormatExe: '',
+    })
+  }
+
+  it('folds the message in before validation, so `git commit` accepts it', async () => {
+    if (!(await canSpawnPiped())) {
+      console.warn('bridge-output case skipped: this environment denies a child with piped stdio')
+      return
+    }
+    const engine = engineWith([])
+    const view = await engine.submitCommand(
+      { cmd: 'git', args: ['commit'], message: 'slice 2: 中文' },
+      agentAt(CWD),
+    )
+    // Folded in, in front of the guardrail: `-m <text>` is argv, and the message
+    // travels as argv rather than through a file or a shell.
+    expect(view.argv).toEqual(['git', 'commit', '-m', 'slice 2: 中文'])
+    expect(view.resolvedArgv).not.toBeNull()
+    // `git commit` outside a repository fails in a few milliseconds; the point is
+    // that it *ran* rather than being refused before anything was registered.
+    const settled = await settledView(engine, view.id)
+    expect(settled.status).toBe('failed')
+  })
+
+  it('refuses a message on a command that has no such flag', async () => {
+    const engine = engineWith([])
+    await expect(
+      engine.submitCommand({ cmd: 'flutter', args: ['test'], message: 'nope' }, agentAt(CWD)),
+    ).rejects.toThrow(/only valid for git commit/u)
+  })
+
+  it('refuses a message alongside the one the argv already carries', async () => {
+    const engine = engineWith([])
+    await expect(
+      engine.submitCommand({ cmd: 'git', args: ['commit', '-m', 'inline'], message: 'both' }, agentAt(CWD)),
+    ).rejects.toThrow(/not both/u)
+  })
+})

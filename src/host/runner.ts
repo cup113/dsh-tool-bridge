@@ -25,13 +25,18 @@ import type { BaselineReport, TestCounts, TestFailure } from '../engine/types'
 import { defaultTreeKill } from './killtree'
 import type { TreeKillFn } from './killtree'
 
-/** What the caller asked to run, before resolution. */
+/**
+ * What the caller asked to run, before resolution.
+ *
+ * No `message` field: an inline commit message is folded into the argv by
+ * `buildArgv` at submit time, *before* validation, because it is argv. A fold
+ * here — which is where it used to live — ran after the guardrail had already
+ * looked for it, and appended `-m` to commands that have no such flag.
+ */
 export interface RunSpec {
   /** The accepted command name or path the caller typed. */
   cmd: string
   args: readonly string[]
-  /** A commit message folded into argv as `-m <text>`; never a file. */
-  message?: string | null
 }
 
 /** The argv that will actually start, plus the environment it starts with. */
@@ -56,9 +61,6 @@ export interface RunPlan {
  */
 export function planRun(spec: RunSpec, cwd: string, dartFormatExe: string): RunPlan {
   const argv = [spec.cmd, ...spec.args]
-  if (spec.message !== null && spec.message !== undefined && spec.message !== '') {
-    argv.push('-m', spec.message)
-  }
   const { argv: resolvedArgv, env } = resolveLaunch(argv, dartFormatExe === '' ? null : dartFormatExe, cwd)
   // The overrides come last, so nothing in the job's own environment can put
   // colour back into a log a model has to read (see `engine/env.ts`).

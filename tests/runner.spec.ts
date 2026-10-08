@@ -29,7 +29,7 @@ import { fileURLToPath } from 'node:url'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import { ToolFailure } from '../src/engine/errors'
-import { ProcessRun } from '../src/host/runner'
+import { ProcessRun, planRun } from '../src/host/runner'
 import type { RunSettlement } from '../src/host/runner'
 import type { TreeKill, TreeKillFn } from '../src/host/killtree'
 import { canSpawnPiped } from './support/spawn'
@@ -258,6 +258,24 @@ describe('ProcessRun: one run, one log, one settlement', () => {
     expect(run.cancel()).toBe(false)
     expect(sweeps).toBe(0)
     expect(child.killCalls).toBe(0)
+  })
+})
+
+describe('planRun: the environment every job starts with', () => {
+  it('turns colour and pagers off, since a model reads the log', () => {
+    // The prevention half of the colour fix (the strip in `engine/ansi.ts` is the
+    // other): a real job log was measured with 240 escape bytes in 2 345 on
+    // Windows, where a reporter colours a *pipe*.
+    const plan = planRun({ cmd: 'git', args: ['status'] }, SCRATCH, '')
+    expect(plan.env['NO_COLOR']).toBe('1')
+    expect(plan.env['PAGER']).toBe('cat')
+    expect(plan.env['GIT_PAGER']).toBe('cat')
+  })
+
+  it('keeps the prompt off for git, alongside the colour overrides', () => {
+    const plan = planRun({ cmd: 'git', args: ['log'] }, SCRATCH, '')
+    expect(plan.env['GIT_TERMINAL_PROMPT']).toBe('0')
+    expect(plan.env['NO_COLOR']).toBe('1')
   })
 })
 

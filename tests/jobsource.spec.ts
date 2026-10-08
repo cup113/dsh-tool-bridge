@@ -163,6 +163,29 @@ describe('LogOutputSource: the log as an incremental stream', () => {
     expect(JOB_OUTPUT_MIRROR_BYTES).toBeGreaterThan(1024 * 1024)
     expect(new LogOutputSource(path).read(0).lossy).toBe(false)
   })
+
+  it('hands the ring text, not terminal colour', () => {
+    const path = scratchPath('colored.log')
+    writeFileSync(path, '\u001b[32m197 passed\u001b[39m\n', 'utf8')
+    expect(new LogOutputSource(path).read(0).text).toBe('197 passed\n')
+  })
+
+  it('holds back an escape sequence the writer has not finished', () => {
+    // The read boundary and the writer's buffer boundary are unrelated, so a
+    // delta can end inside a sequence. Emitting the fragment would put `[32m`
+    // into the ring one read later — the same damage as not stripping at all.
+    const path = scratchPath('split-escape.log')
+    const sequence = Buffer.from('\u001b[32m', 'utf8')
+    writeFileSync(path, Buffer.concat([Buffer.from('done '), sequence.subarray(0, 3)]))
+    const first = new LogOutputSource(path).read(0)
+    expect(first.text).toBe('done ')
+    expect(first.nextOffset).toBe(5)
+
+    appendFileSync(path, sequence.subarray(3))
+    const second = new LogOutputSource(path).read(first.nextOffset)
+    expect(second.text).toBe('')
+    expect(second.nextOffset).toBe(10)
+  })
 })
 
 describe('logMirror: which jobs register a source at all', () => {

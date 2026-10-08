@@ -258,14 +258,28 @@ _Avoid_: failure inventory, failure list, "the fixed format"
 
 **Tail**:
 How many log lines a tool result returns — `bridge_run` defaults to 200, capped at
-5000, `0` for none.
+5000, `0` for none. A Tail is **plain text**: terminal escape sequences are
+removed before the lines are counted and returned, so a caller's regex matches
+the string it receives (ADR-0010).
 _Avoid_: maxLines, limit, count, head
 
 **Log filter** (`grep`):
 An optional regex that selects which log lines are eligible; `tail` then caps the
 number returned. The result's `log` object reports `matched`, `returned`,
-`scannedLines` and `truncated` so "no matches" never reads as "no output".
+`scannedLines` and `truncated` so "no matches" never reads as "no output". The
+pattern is matched against the colour-stripped text, so `matched` describes the
+lines the caller actually gets (ADR-0010).
 _Avoid_: search, filter, pattern match
+
+**Plain text**:
+What every model-facing read of a log is — a **Tail**, a **Log filter** result, a
+**Digest**, a **Log mirror** delta. Colour is turned off for every tool the
+plugin starts (`NO_COLOR`, `PAGER`, `GIT_PAGER` — the harness's own overrides for
+its shell tools) *and* stripped at every read, because the override is a
+convention: on Windows a reporter colours a pipe happily, and a colour-bearing
+`Tests  197 passed (197)` line produced a null **Digest** for a green suite. The
+log file keeps its raw bytes (ADR-0010).
+_Avoid_: sanitised (that suggests security), formatted, rendered
 
 ### Git surface
 
@@ -466,6 +480,7 @@ kept under that term.
 - "`wait: false` sends a job to the background" — resolved: no such field. A job is either awaited inside the call or submitted with `background: true`; the harness's `job_output`, `job_kill` and
 completion notices are the same either way.
 - "`job_output` shows a bridge job's output" — it did not, and every read of a bridge job returned `(no new output)` whatever the job did: the tool's output went to its own log file while `job_output` reads the harness's output ring, and nothing wrote to that ring. Fixed by the **Log mirror** (ADR-0009). The failure was silent by construction — a well-formed empty answer for a job that passed, failed, was still running or had settled — which is why it survived a session's worth of use.
+- "the log has no colour, because a job has no TTY" — it has colour, and the assumption cost the **Digest** a whole green suite: vitest's reporter colours a pipe on Windows, and the `^`-anchored vitest patterns matched nothing. Resolved by **Plain text** — overrides plus a strip at every read (ADR-0010); the assertion is now measured rather than assumed, and the log file still keeps its raw bytes.
 - "the job's output ring is the plugin's" — resolved: it is the harness's, the plugin only supplies a **Log mirror** source, and the registry owns the read cadence. That split is what made the bug look like the harness's for as long as it did.
 - "a timed-out `bridge_run` killed my job" — resolved: it did not. Expiry returns the **Job** as it stands (`queued`/`running`, with `aheadOf`) and nothing is killed; read it on with `job_output`.
 - "a browser tool is a **Job** because the plugin hosts it" — resolved: it is not. It creates no **Job**, appears in no **Lane**, has no log and no **Digest**; it belongs to the **Scoped mount**.

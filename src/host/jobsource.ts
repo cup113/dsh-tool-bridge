@@ -30,7 +30,13 @@
  * read that ends mid-character would decode a replacement character and the
  * caller would see mojibake in the middle of CJK output — the exact class of
  * damage this project avoids elsewhere. A trailing partial sequence is therefore
- * held back and re-read with the bytes that complete it.
+ * held back and re-read with the bytes that complete it. An escape sequence the
+ * writer has not finished is held back the same way, and for the same reason.
+ *
+ * **The mirror is text, not bytes.** Escape sequences are stripped from what the
+ * ring carries (see `engine/ansi.ts`): the ring is read by a model, which cannot
+ * use colour, and a stripped delta is what keeps a coloured reporter from
+ * spending tokens on `[32m`. The log file keeps the raw bytes.
  *
  * **The mirror is bounded.** Past {@link JOB_OUTPUT_MIRROR_BYTES} the source
  * stops advancing its window and reports a lossy read, which the ring renders as
@@ -41,6 +47,8 @@
 import { closeSync, openSync, readSync, statSync } from 'node:fs'
 
 import type { JobOutputSource, JobSourceRead } from '@deepseek-ai/dsh-jobs'
+
+import { incompleteEscapeSuffix, stripAnsi } from '../engine/ansi'
 
 /**
  * How much of a job's output is mirrored into the ring, in bytes.
@@ -156,9 +164,13 @@ export class LogOutputSource implements JobOutputSource {
     if (start >= size) return { text: '', nextOffset: start, lossy, spillPath: this.path }
     const bytes = this.bytesOf(start, size)
     if (bytes === null) return { text: '', nextOffset: start, lossy: false }
-    const usable = completeUtf8Prefix(bytes)
+    // Two kinds of incomplete tail are held back for the next read: a character
+    // the writer split, and an escape sequence the writer has not finished. Both
+    // would otherwise decode into visible damage at exactly this boundary.
+    const whole = completeUtf8Prefix(bytes)
+    const usable = whole - incompleteEscapeSuffix(bytes.subarray(0, whole))
     return {
-      text: bytes.subarray(0, usable).toString('utf8'),
+      text: stripAnsi(bytes.subarray(0, usable).toString('utf8')),
       nextOffset: start + usable,
       lossy,
       spillPath: this.path,

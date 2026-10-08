@@ -242,6 +242,78 @@ describe('vitest digest: the reporter read the way the flutter one already was',
 })
 
 /**
+ * Colour, which this bridge's own jobs really do get.
+ *
+ * `digest.ts` assumed a colourless log ("no TTY, so no colour") and the fixtures
+ * are colourless, so nothing here noticed that the assumption is false on
+ * Windows: vitest's reporter colours through a pipe because `tinyrainbow` counts
+ * `platform === 'win32'` as colour support, and a real job log was measured with
+ * 240 escape bytes in 2 345. Every vitest line regex is `^`-anchored, so a run
+ * whose summary line begins with `\u001b[2m` produces no counts at all — the
+ * digest silently reported nothing for a green suite.
+ *
+ * The sequences below are the measured ones, copied from a real job log
+ * (`~/.dsh/toolbridge/logs/1791447598494-f356694e.log`), including the
+ * `\u001b[22m\u001b[1m` reverse the reporter emits around a bold run.
+ */
+const ESC = '\u001b'
+const DIM = `${ESC}[2m`
+const DIM_OFF = `${ESC}[22m`
+const BOLD = `${ESC}[1m`
+const GREEN = `${ESC}[32m`
+const RED = `${ESC}[31m`
+const COLOUR_OFF = `${ESC}[39m`
+const GRAY = `${ESC}[90m`
+
+describe('a coloured log digests exactly like a plain one', () => {
+  it('reads the vitest summary through the reporter\'s escapes', () => {
+    const log = scratchLog(
+      'colored.txt',
+      `${DIM}      Tests ${DIM_OFF} ${BOLD}${GREEN}3 passed${COLOUR_OFF}${DIM_OFF}${GRAY} (3)${COLOUR_OFF}\n` +
+        `${DIM}   Duration ${DIM_OFF} 1.94s${DIM}\n` +
+        `${DIM} Test Files ${DIM_OFF} ${BOLD}${GREEN}1 passed${COLOUR_OFF}${DIM_OFF}${GRAY} (1)${COLOUR_OFF}\n`,
+    )
+    const result = analyzeTestLog(VITEST, log)
+    expect(result.counts).toEqual({ passed: 3, skipped: 0, failed: 0 })
+    expect(result.summary).toBe('3 passed')
+  })
+
+  it('keeps a coloured failure inventory, and its counts', () => {
+    const log = scratchLog(
+      'colored-failure.txt',
+      `${DIM} ❯${DIM_OFF} ${RED}src/App.test.ts${COLOUR_OFF} (2 tests | 1 failed) 6ms\n\n` +
+        `${RED} FAIL ${COLOUR_OFF} src/App.test.ts > add > fails on purpose\n` +
+        `AssertionError: expected 3 to be 4\n\n` +
+        `${DIM}      Tests ${DIM_OFF} ${BOLD}${RED}1 failed${COLOUR_OFF}${DIM_OFF} | ${BOLD}${GREEN}1 passed${COLOUR_OFF}${DIM_OFF}${GRAY} (2)${COLOUR_OFF}\n`,
+    )
+    const result = analyzeTestLog(VITEST, log)
+    expect(result.counts).toEqual({ passed: 1, skipped: 0, failed: 1 })
+    expect(result.failures).toHaveLength(1)
+    expect(result.failures[0]?.file).toBe('src/App.test.ts')
+    expect(result.failures[0]?.name).toBe('add > fails on purpose')
+  })
+
+  it('reads a `package:test` progress line through escapes anywhere in it', () => {
+    // Synthetic on purpose — no captured coloured flutter log was available, and
+    // the point is the general one: the reader's two parsers share one line
+    // source, so an escape the reporter puts anywhere must not defeat them.
+    const log = scratchLog(
+      'colored-flutter.txt',
+      `${ESC}[32m00:25 +67${ESC}[0m ~2 ${ESC}[31m-4${ESC}[0m: a failing test ${ESC}[31m[E]${ESC}[0m\n` +
+        `${ESC}[1mFailing tests:${ESC}[0m\n` +
+        `  ${ESC}[31msrc/a_test.dart: a failing test${ESC}[0m\n` +
+        `${ESC}[31mSome tests failed.${ESC}[0m\n`,
+    )
+    const result = analyzeTestLog(FLUTTER_TEST, log)
+    expect(result.counts).toEqual({ passed: 67, skipped: 2, failed: 4 })
+    expect(result.summary).toBe('67 passed, 4 failed')
+    expect(result.failures).toHaveLength(1)
+    expect(result.failures[0]?.name).toBe('a failing test')
+    expect(result.failures[0]?.file).toBe('src/a_test.dart')
+  })
+})
+
+/**
  * The Python suite exercises these only through `analyze_test_log`, so its
  * branches no fixture reaches (a terminal run with no counts, the orphan path
  * of `attach_paths`, the `skipped` suffix) are pinned here directly from the

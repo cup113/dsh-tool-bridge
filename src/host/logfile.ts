@@ -12,6 +12,8 @@
 
 import { closeSync, openSync, readFileSync, readSync, statSync } from 'node:fs'
 
+import { stripAnsi } from '../engine/ansi'
+
 /** How much of the end of a log an unfiltered tail reads. */
 export const TAIL_SCAN_BYTES = 256 * 1024
 /** The default number of log lines a response carries. */
@@ -60,11 +62,16 @@ function readWindow(path: string, bytes: number): { text: string; whole: boolean
  *
  * When the window did not reach the start of the file, its first line is a
  * fragment of a longer one and is dropped: half a line is not a line.
+ *
+ * Escape sequences are removed before the split, so the caller's lines are text
+ * — this is the view the model and the panel read, and neither can render
+ * colour (see `engine/ansi.ts`). A sequence the window cut in half goes with the
+ * line it started in.
  */
 export function readTailText(path: string, lines: number): string {
   if (lines <= 0) return ''
   const { text, whole } = readWindow(path, TAIL_SCAN_BYTES)
-  let split = text.split(/\r\n|[\r\n]/u)
+  let split = stripAnsi(text).split(/\r\n|[\r\n]/u)
   if (!whole && split.length > 1) split = split.slice(1)
   if (split.at(-1) === '') split.pop()
   return split.slice(-lines).join('\n')
@@ -74,6 +81,11 @@ export function readTailText(path: string, lines: number): string {
  * The log tail, optionally keeping only lines a regex matches, plus the view's
  * account of what happened.
  *
+ * The strip happens before the split and the count, deliberately: `matched`,
+ * `returned` and `scannedLines` describe the text the caller actually receives,
+ * so a pattern is never matched against bytes that were then removed from the
+ * answer — a filter that lies about what it counted is worse than no filter at
+ * all.
  * @param path - the job's log file.
  * @param grep - the caller's pattern, or null for the bounded tail.
  * @param lines - how many lines may be returned.
@@ -88,7 +100,7 @@ export function readFiltered(path: string, grep: RegExp | null, lines: number): 
   }
   let text: string
   try {
-    text = readFileSync(path, 'utf8')
+    text = stripAnsi(readFileSync(path, 'utf8'))
   } catch {
     text = ''
   }

@@ -11,6 +11,7 @@
  */
 
 import { readFileSync } from 'node:fs'
+import { stripAnsi } from './ansi'
 import { isTestRun, isVitestRun, mightRunVitest, splitPathAndName } from './argv'
 import type { TestCounts, TestFailure, TestLogDigest } from './types'
 
@@ -34,9 +35,9 @@ const TEST_TERMINAL_MARKERS: readonly string[] = [
 /* ------------------------------------------------------------ vitest lines */
 
 /*
- * vitest 5's default reporter, as a job log gets it (no TTY, so no colour). The
- * end-of-run summary is both the authoritative count and the only proof the run
- * finished — there is no flutter-style "Some tests failed." marker:
+ * vitest 5's default reporter, as a job log gets it. The end-of-run summary is
+ * both the authoritative count and the only proof the run finished — there is
+ * no flutter-style "Some tests failed." marker:
  *
  *        Test Files  1 failed | 1 passed (2)
  *             Tests  1 failed | 3 passed (4)
@@ -44,6 +45,10 @@ const TEST_TERMINAL_MARKERS: readonly string[] = [
  * A run killed mid-suite prints neither, which is why `counts === null` stays
  * "see log". Anchoring on `Tests`/`Test Files` **followed by two spaces** is
  * also what keeps jest's `Tests: 1 failed, 2 passed, 3 total` out.
+ *
+ * "No TTY, so no colour" is *not* true here, which is why `readLogLines` strips
+ * first: measured on Windows, a piped vitest run still emits the escapes, and a
+ * `^`-anchored pattern never sees such a line at all.
  */
 const VITEST_TESTS_LINE_RE = /^ *Tests {2,}(?<body>\S.*)$/
 const VITEST_FILES_LINE_RE = /^ *Test Files {2,}(?<body>\S.*)$/
@@ -80,11 +85,16 @@ const VITEST_LOAD_PREFIX = 'loading '
  *
  * `undefined` is the unreadable-file arm — Python's `OSError` — which every
  * caller answers exactly as the Python does.
+ *
+ * Colour is stripped here, at the one point both reporters' lines come from:
+ * the assumption below that a piped job log is colourless is false on Windows
+ * (see `ansi.ts`), and every pattern in this file anchors on `^`, so a coloured
+ * line did not merely look odd — it produced no counts at all.
  */
 function readLogLines(logPath: string): string[] | undefined {
   let text: string
   try {
-    text = readFileSync(logPath, 'utf8')
+    text = stripAnsi(readFileSync(logPath, 'utf8'))
   } catch {
     return undefined
   }

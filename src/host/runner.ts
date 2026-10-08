@@ -18,6 +18,7 @@ import type { WriteStream } from 'node:fs'
 import { dirname } from 'node:path'
 
 import { analyzeTestLog } from '../engine/digest'
+import { TOOL_ENV_OVERRIDES } from '../engine/env'
 import { ToolFailure } from '../engine/errors'
 import { resolveLaunch } from '../engine/resolve'
 import type { BaselineReport, TestCounts, TestFailure } from '../engine/types'
@@ -59,7 +60,9 @@ export function planRun(spec: RunSpec, cwd: string, dartFormatExe: string): RunP
     argv.push('-m', spec.message)
   }
   const { argv: resolvedArgv, env } = resolveLaunch(argv, dartFormatExe === '' ? null : dartFormatExe, cwd)
-  const merged: NodeJS.ProcessEnv = { ...process.env, ...env }
+  // The overrides come last, so nothing in the job's own environment can put
+  // colour back into a log a model has to read (see `engine/env.ts`).
+  const merged: NodeJS.ProcessEnv = { ...process.env, ...env, ...TOOL_ENV_OVERRIDES }
   // Nothing may block on a prompt this process has no terminal to answer: a git
   // credential or signing prompt would hang a job until its timeout.
   if (resolvedArgv.some((token) => token.toLowerCase().includes('git'))) {

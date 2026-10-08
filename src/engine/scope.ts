@@ -13,6 +13,7 @@
 import { execFile } from 'node:child_process'
 import type { ExecFileException } from 'node:child_process'
 import { commandName } from './argv'
+import { TOOL_ENV_OVERRIDES } from './env'
 import { RefusalError } from './errors'
 import {
   GIT_STATUS_TIMEOUT_MS,
@@ -109,8 +110,10 @@ export function runGitStatus(cwd: string): Promise<string> {
         windowsHide: true,
         encoding: 'utf8',
         // No credential prompt: this process has no terminal to answer one, so
-        // a prompt would cost the whole request.
-        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        // a prompt would cost the whole request. The colour overrides ride along
+        // for the same reason they do on a job: whatever this returns is parsed
+        // and shown, and terminal bytes in it are nobody's friend.
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...TOOL_ENV_OVERRIDES },
       },
       (error, stdout, stderr) => {
         if (error === null) {

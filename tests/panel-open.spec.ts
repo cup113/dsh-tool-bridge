@@ -2,10 +2,11 @@
  * Opening the panel from the composer row.
  *
  * Two facts are pinned here, and both were wrong in the same way once: the open
- * must name the conversation it belongs to (the host can only infer one when
- * exactly one session is live), and a rejected open must not escape into the
- * row's click handler (a navigation shortcut is not worth failing a render
- * over).
+ * must be a plain page open — the conversation it belongs to is resolved by the
+ * seat the panel is drawn in, never carried by the open, because the sidebar's
+ * own guide opens this type by kind alone — and a rejected open must not escape
+ * into the row's click handler (a navigation shortcut is not worth failing a
+ * render over).
  */
 
 import { describe, expect, it, vi } from 'vitest'
@@ -13,13 +14,15 @@ import { describe, expect, it, vi } from 'vitest'
 import { PANEL_KIND, openPanel } from '../src/client/openPanel'
 
 describe('openPanel', () => {
-  it('opens the page by kind, carrying the conversation as a navigation parameter', () => {
-    const openTab = vi.fn<(kind: string, options?: { params?: { sessionId: string } }) => void>()
+  it('opens the page by kind, naming no conversation', () => {
+    const openTab = vi.fn<(kind: string) => void>()
 
-    openPanel({ openTab }, 'session-a')
+    openPanel({ openTab })
 
     expect(openTab).toHaveBeenCalledTimes(1)
-    expect(openTab).toHaveBeenCalledWith(PANEL_KIND, { params: { sessionId: 'session-a' } })
+    // `toHaveBeenCalledWith` is exact: a re-introduced `{ params: … }` second
+    // argument fails this case, which is the point of it.
+    expect(openTab).toHaveBeenCalledWith(PANEL_KIND)
   })
 
   it('reports a rejected open instead of throwing at the click handler', () => {
@@ -28,7 +31,7 @@ describe('openPanel', () => {
     })
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
 
-    expect(() => openPanel({ openTab }, 'session-a')).not.toThrow()
+    expect(() => openPanel({ openTab })).not.toThrow()
     expect(warn).toHaveBeenCalledTimes(1)
     expect(String(warn.mock.calls[0]?.[1])).toContain('no mounted Session surface')
 

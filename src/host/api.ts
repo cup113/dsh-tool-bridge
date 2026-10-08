@@ -66,10 +66,25 @@ export function registerApi(
       try {
         if (route === '/state' && req.method === 'GET') {
           const sessionId = url.searchParams.get('sessionId') ?? ''
+          // A panel is a view of one conversation and the seat it is drawn in is
+          // session-scoped, so the browser half always knows which one it means.
+          // Refusing the empty id is what keeps "no conversation" from being
+          // answered as a well-formed empty panel: that guess (`the only live
+          // session`) is what made a panel opened from the sidebar read `0 jobs`
+          // however much the conversation had run (ADR-0012).
+          if (sessionId === '') {
+            send(res, 400, {
+              error: {
+                code: 'bad-request',
+                message: 'sessionId is required: a panel answers for one conversation',
+              },
+            })
+            return
+          }
           const state = await switches.state(sessionId)
           send(res, 200, {
             ...state,
-            jobs: state.sessionId === null ? [] : engine.listForOwner(state.sessionId),
+            jobs: engine.listForOwner(sessionId),
             config: {
               dartFormatExe: config.dartFormatExe === '' ? null : config.dartFormatExe,
               defaultTimeoutSec: config.defaultTimeoutSec,

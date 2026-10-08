@@ -37,19 +37,6 @@ import { CLIENT_SERVICES } from './services'
 /** The tab type's identity: a package name is the natural value. */
 const TAB_ID = '@cup113/dsh-plugin-toolbridge'
 
-declare module '@deepseek-ai/dsh-client-ui-sidebar-right/client' {
-  interface SidebarRightTabParamsMap {
-    /**
-     * The conversation whose panel is open.
-     *
-     * Carried rather than left to the body's own guess: the host can only infer a
-     * conversation when exactly one is live, so a panel opened beside a second
-     * window would have nothing to show.
-     */
-    bridge: { readonly sessionId: string }
-  }
-}
-
 /** Services this half needs; every `ctx.<name>` it touches is listed there. */
 export const inject = [...CLIENT_SERVICES]
 
@@ -87,7 +74,19 @@ export function apply(ctx: Context): void {
   ctx.effect(
     () =>
       ctx.slots.inject('sidebar.right.pane.tab', () =>
-        ctx.slots.register({ name: 'sidebar.right.pane.tab', key: TAB_ID }, BridgePanel),
+        ctx.slots.register(
+          {
+            name: 'sidebar.right.pane.tab',
+            key: TAB_ID,
+            // The seat is session-scoped, so the framework resolves the
+            // conversation of the pane the tab is drawn in and hands it to this
+            // factory — the one source for "which panel is this". A page opened
+            // from the sidebar's own guide carries no navigation parameters, so a
+            // body that reads its conversation off the tab has none (ADR-0012).
+            inject: (sessionId: string) => ({ sessionId }),
+          },
+          BridgePanel,
+        ),
       ),
     'toolbridge tab body',
   )
@@ -113,11 +112,13 @@ export function apply(ctx: Context): void {
             order: 30,
             // The dock's owner props carry the input zone, not the conversation;
             // asking for the session id here is how a dock entry learns which
-            // conversation it belongs to, and the panel's opener travels the same
-            // way (the shell's own job list passes its service calls like this).
+            // conversation it belongs to (the shell's own job list passes its
+            // service calls like this). The panel opener needs none of it: it
+            // opens beside the conversation the sidebar is showing, and that
+            // panel's own seat tells it which one that is.
             inject: (sessionId: string) => ({
               sessionId,
-              openPanel: () => openPanel(ctx.sidebarRight, sessionId),
+              openPanel: () => openPanel(ctx.sidebarRight),
             }),
           },
           Switches,

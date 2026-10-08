@@ -60,6 +60,8 @@ failed. The icon at the row's end opens the panel in the sidebar.
 depth, the formatter pin, the browser's flags, every job with its digest
 summary, and the selected job's log — the thing the old server opened a browser
 tab for, without the token in the address bar and without a page that goes stale.
+It answers for the conversation it is opened beside, whether it came from the
+row's icon or from the sidebar's own guide.
 
 ## Install
 

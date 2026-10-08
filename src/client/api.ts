@@ -29,7 +29,8 @@ export interface PanelJob {
 
 /** Everything the sidebar needs for one conversation. */
 export interface SessionView {
-  sessionId: string | null
+  /** The conversation the host answered about; it never answers about a guessed one. */
+  sessionId: string
   toggles: ToggleState
   defaults: ToggleState
   cwd: string | null

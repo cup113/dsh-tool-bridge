@@ -8,6 +8,15 @@
  * two facts the human actually needs when a build looks stuck: how deep each lane
  * is, and what the current job is printing.
  *
+ * **Which conversation it is a panel of comes from the seat, not from the tab.**
+ * The seat is session-scoped, so the framework resolves the conversation of the
+ * pane this body is drawn in and hands it over (`sessionId` below). It is not
+ * read off `useTabInfo().tab.navigation.params`: the sidebar's own guide opens a
+ * page type by kind alone, so a panel opened from the guide carries no
+ * navigation parameters at all — reading them left this panel asking the host
+ * about no conversation, and the host answered "0 jobs" for every one of them
+ * (ADR-0012).
+ *
  * The panel is deliberately read-only about the switches: they live in the
  * conversation row above the composer, and a capability switch duplicated in two
  * places is a switch that eventually disagrees with itself.
@@ -28,7 +37,7 @@
 
 import { useCallback, useEffect, useState } from 'react'
 import type { CSSProperties } from 'react'
-import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
+import type { InjectFace, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-sidebar-right/client'
 
 import { fetchJob, fetchState } from './api'
@@ -95,18 +104,35 @@ function formatterLine(view: SessionView): string {
 }
 
 /**
- * Render the panel.
- * @param props - the seat's runtime face; the conversation arrives as the tab's navigation parameter.
+ * What the tab seat hands this panel.
+ *
+ * A session-scoped seat is rendered under one conversation's scope, and the
+ * framework resolves that scope before the body can mount at all — a strict
+ * session slot with no binding is a `SlotAssemblyError`, not an empty id. So
+ * there is no "which conversation?" case to handle here, and none to guess at.
  */
-export function BridgePanel(props: PropsRuntime<'sidebar.right.pane.tab'>): React.ReactElement {
-  const sessionId = resolveSessionId(props)
+export interface BridgePanelInjected {
+  /** The conversation of the pane this tab is drawn in. */
+  sessionId: string
+}
+
+/** The panel's props: the seat's runtime face plus the session the seat resolved. */
+export type BridgePanelProps =
+  & PropsRuntime<'sidebar.right.pane.tab'>
+  & InjectFace<BridgePanelInjected>
+
+/**
+ * Render the panel.
+ * @param props - the seat's runtime face and the conversation it belongs to.
+ */
+export function BridgePanel({ sessionId }: BridgePanelProps): React.ReactElement {
   const [view, setView] = useState<SessionView | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<string | null>(null)
   const [tail, setTail] = useState<string>('')
 
   const refresh = useCallback(async (): Promise<void> => {
-    const result = await fetchState(sessionId ?? '')
+    const result = await fetchState(sessionId)
     if (result.ok) {
       setView(result.value)
       setError(null)
@@ -225,19 +251,4 @@ export function BridgePanel(props: PropsRuntime<'sidebar.right.pane.tab'>): Reac
       )}
     </div>
   )
-}
-
-/**
- * The conversation a tab body answers for, from the tab's navigation parameters.
- *
- * The opener passes it (`openPanel`), so the panel never has to infer the
- * conversation from "which session happens to be live".
- */
-function resolveSessionId(props: PropsRuntime<'sidebar.right.pane.tab'>): string | undefined {
-  const params = props.useTabInfo().tab.navigation.params
-  if (typeof params === 'object' && params !== null && 'sessionId' in params) {
-    const candidate = (params as { sessionId?: unknown }).sessionId
-    if (typeof candidate === 'string' && candidate !== '') return candidate
-  }
-  return undefined
 }

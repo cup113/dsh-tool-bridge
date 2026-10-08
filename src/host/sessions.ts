@@ -41,8 +41,8 @@ interface Applied {
 
 /** What the sidebar reads for one conversation. */
 export interface PanelState {
-  /** The conversation this answers for; null when none could be determined. */
-  sessionId: string | null
+  /** The conversation this answers for, exactly as it was asked for. */
+  sessionId: string
   toggles: ToggleState
   defaults: ToggleState
   cwd: string | null
@@ -61,7 +61,7 @@ export interface PanelState {
 
 export class SessionSwitches {
   private readonly applied = new Map<string, Applied>()
-  /** Live agents by session id: the panel's fallback when its props carry no id. */
+  /** Live agents by session id, so a panel read can report a session's directory. */
   private readonly live = new Map<string, Agent>()
   /** Why a conversation's last browser mount failed; cleared by a successful mount or a switch-off. */
   private readonly browserErrors = new Map<string, string>()
@@ -128,34 +128,29 @@ export class SessionSwitches {
   /**
    * Everything the sidebar needs about one conversation.
    *
-   * An empty id means "the conversation the browser is looking at, whichever it
-   * is": with exactly one live session that is unambiguous, and with none or
-   * several the panel is told there is nothing to show rather than being handed
-   * another conversation's jobs.
-   * @param sessionId - the conversation, or an empty string for the sole live one.
+   * The conversation is named by the caller and never inferred here. It used to
+   * accept an empty id and fall back to "the only live session", which is what
+   * made a panel with no conversation render as a well-formed `Jobs (0)` rather
+   * than as the absence it was: the browser half asked with no id exactly when it
+   * did not know which pane it was in, and this answered confidently about a
+   * different question (ADR-0012).
+   * @param sessionId - the conversation, named by the seat the panel is drawn in.
    * @returns the panel's view.
    */
   async state(sessionId: string): Promise<PanelState> {
-    const id = sessionId !== '' ? sessionId : this.soleLiveSession()
-    const toggles = id === null ? this.store.defaultState : this.store.get(id)
-    const known = id === null ? null : (this.store.cwd(id) ?? null)
-    const live = id === null ? undefined : (this.live.get(id) ?? (this.ctx.agents.get(id as never) as Agent | undefined))
+    const toggles = this.store.get(sessionId)
+    const known = this.store.cwd(sessionId)
+    const live = this.live.get(sessionId) ?? (this.ctx.agents.get(sessionId as never) as Agent | undefined)
     const cwd = live?.session.header.cwd ?? known
     return {
-      sessionId: id,
+      sessionId,
       toggles,
       defaults: this.store.defaultState,
       cwd: cwd ?? null,
-      lanes: cwd === undefined || cwd === null ? { queue: 0, long: 0 } : this.engine.depth(cwd),
-      browserMounted: id !== null && this.applied.get(id)?.unmountBrowser !== undefined,
-      browserError: id === null ? null : (this.browserErrors.get(id) ?? null),
+      lanes: cwd === undefined ? { queue: 0, long: 0 } : this.engine.depth(cwd),
+      browserMounted: this.applied.get(sessionId)?.unmountBrowser !== undefined,
+      browserError: this.browserErrors.get(sessionId) ?? null,
     }
-  }
-
-  /** The only live session, when there is exactly one. */
-  private soleLiveSession(): string | null {
-    if (this.live.size !== 1) return null
-    return [...this.live.keys()][0] ?? null
   }
 
   private applyRestriction(agent: Agent): void {

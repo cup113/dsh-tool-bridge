@@ -6,6 +6,14 @@
  * the call in its own module is what lets a test drive that path at all: the
  * components next door cannot be imported outside a browser (the shell's frozen
  * module table is not resolvable in Node), and this is the half that broke.
+ *
+ * The open names a page kind and nothing else. It used to carry the conversation
+ * as a navigation parameter, which is how the panel knew which session to show
+ * when it was opened from this row — and is exactly why the same panel opened
+ * from the sidebar's own guide (which opens a type by kind alone) showed an
+ * empty job list: the parameter was absent, and the panel had no other source
+ * for its conversation. The conversation now comes from the seat, which is
+ * session-scoped and therefore knows it (ADR-0012).
  */
 
 /** The page kind the tab type registers and `openTab` names. */
@@ -19,26 +27,23 @@ export const PANEL_KIND = 'bridge'
  */
 export interface PanelOpener {
   /**
-   * Open a page type by kind.
+   * Open a page kind, in the pane holding the tab the caller is in.
    * @param kind - the registered page kind.
-   * @param options - the kind's navigation parameters.
    */
-  openTab(kind: string, options?: { readonly params?: { readonly sessionId: string } }): void
+  openTab(kind: string): void
 }
 
 /**
- * Open this conversation's panel tab, tolerating the cases where it cannot open.
+ * Open the panel tab beside the conversation the caller is in.
  *
- * The session id travels as a navigation parameter rather than being left for the
- * body to guess: the sidebar's own `state` endpoint can only infer a conversation
- * when exactly one is live, and a panel that goes blank in a second window is a
- * worse panel.
+ * The tab lands in the on-screen session's own surface, and the body reads that
+ * session from its seat; nothing about the conversation travels through this
+ * call.
  * @param right - the sidebar's navigation face (`ctx.sidebarRight`).
- * @param sessionId - the conversation whose panel is being opened.
  */
-export function openPanel(right: PanelOpener, sessionId: string): void {
+export function openPanel(right: PanelOpener): void {
   try {
-    right.openTab(PANEL_KIND, { params: { sessionId } })
+    right.openTab(PANEL_KIND)
   } catch (error) {
     // A kind nothing registered, or a write with no mounted Session surface: the
     // row's switches keep working either way, so this is reported the way the

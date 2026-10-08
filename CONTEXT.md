@@ -53,6 +53,15 @@ server process belong to that conversation alone and unwind with it; this
 replaced the **Resident row**.
 _Avoid_: resident row, global MCP, shared browser
 
+**Panel**:
+The right sidebar's tab for one conversation's toolchain — its working directory,
+the depth of both lanes, the job rows and a selected job's log — reached from the
+row above the composer card or from the sidebar's own guide. It is a page type in
+the sidebar rather than a page of its own, and it answers for the conversation of
+the seat it is drawn in: the seat is session-scoped, so the framework hands it
+that conversation, and no opener names one (ADR-0012).
+_Avoid_: status page, bridge window, dashboard, jobs tab
+
 **Working directory**:
 The directory a job runs in: the calling session's `cwd`, fixed at submit time,
 which no request can retarget.
@@ -415,6 +424,7 @@ kept under that term.
 - A lane pair is keyed by **Working directory**, not by session: two conversations on one directory share one **Queue** and one **Long lane**, which is what stops two Flutter builds from sharing a `build/` directory.
 - An **Engine** serves whatever **Tool bridge** is loaded and keeps one **Job ledger** and one log directory for it.
 - A **Switch** decides what a conversation sees: the toolchain switch removes or restores the two tools' schemas on that conversation's own scope, and the browser switch mints or disposes the **Scoped mount** whose tools and process are that conversation's.
+- A **Panel** answers for the conversation of the seat it is drawn in, and every way into it lands the same page: the seat is session-scoped, so the framework hands the body that conversation, while the sidebar's own guide opens a page type by kind alone and cannot carry one (ADR-0012).
 - A **Scoped mount** belongs to one conversation: its scope is minted for one agent, so its tools and its MCP server process exist only while that switch is on and unwind with the conversation.
 - **Archiving a conversation stops its jobs**: a **Job** is owned by the calling session, and the jobs registry's Workspace archive admission ends every job an archived conversation owns.
 - A **Digest** holds one **Counts** and one **Failure inventory**; the **`Failing tests:` block** may supply a path to the inventory but never its order or completeness.
@@ -520,3 +530,4 @@ completion notices are the same either way.
 - "the browser runs in the toolchain half" — resolved: false by construction. The browser is an MCP server spawned over stdio by the **Scoped mount**, and the **Allowlist** — a **Guardrail**, not a boundary — does not reach it.
 - "an always-on MCP server" — resolved: there is none. No server process and no schema exists until a conversation's **Switch** mounts one, and that mount is disposed with the switch or the conversation.
 - "the walkthrough proves the UI works" — resolved: it does not, by itself. A **UI walkthrough** is exploratory and produces artifacts and findings; only a script-driven E2E run produces a **Digest** with **Counts** and a **Failure inventory** that CI can repeat.
+- "the panel opened from the right sidebar is empty" — it was, with `Jobs (0)` and `no working directory yet`, for the same conversation whose panel the composer row's icon opened with four job rows in it. The two entry points differ in one way: the row passed the conversation as a navigation parameter and the sidebar's own guide cannot, because a guide capsule opens a page type by kind alone. The panel had no other source for its conversation, so it asked the host about *no* conversation (`fetchState(sessionId ?? '')`), and `/state` read that empty id as "the only live session, whichever it is" and returned the view of nothing. Resolved by taking the conversation from the **Panel**'s own seat — session-scoped, so the framework hands the body the pane's session — and by refusing an empty id at the route (ADR-0012). The failure was silent by construction: a well-formed empty panel looks exactly like a quiet conversation.

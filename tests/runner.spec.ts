@@ -32,6 +32,7 @@ import { ToolFailure } from '../src/engine/errors'
 import { ProcessRun } from '../src/host/runner'
 import type { RunSettlement } from '../src/host/runner'
 import type { TreeKill, TreeKillFn } from '../src/host/killtree'
+import { canSpawnPiped } from './support/spawn'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const SCRATCH = join(HERE, '.tmp-runner')
@@ -280,28 +281,6 @@ function reap(pid: number): void {
   } catch {
     // Already gone between the check and the kill.
   }
-}
-
-/**
- * Whether this process may start a child with piped stdio at all.
- *
- * The DSH file sandbox denies the named pipes libuv needs for that, so the
- * answer is no under `workspace-write` and yes in CI. Measuring it keeps the
- * drill honest: a skip here says "not measurable in this environment", never
- * "passed".
- */
-async function canSpawnPiped(): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
-    let child: ChildProcess
-    try {
-      child = spawn(process.execPath, ['-e', ''], { stdio: ['ignore', 'pipe', 'pipe'] })
-    } catch {
-      resolve(false)
-      return
-    }
-    child.on('error', () => resolve(false))
-    child.on('close', () => resolve(true))
-  })
 }
 
 /**

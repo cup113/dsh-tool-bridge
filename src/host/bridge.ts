@@ -21,7 +21,7 @@ import { join } from 'node:path'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { JobHandle, JobHooks, JobId, JobOutcome } from '@deepseek-ai/dsh-jobs'
+import type { JobHandle, JobHooks, JobId, JobOutcome, JobOutputSource } from '@deepseek-ai/dsh-jobs'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
 import { baselineReport, loadKnownFailures, summarizeWithBaseline } from '../engine/baseline'
@@ -31,6 +31,7 @@ import { pathFilterRegex, scopeMode, scopeRefusal, uncommittedDartFiles } from '
 import { LANE_LONG, LANE_QUEUE, SCOPE_UNCOMMITTED } from '../engine/surface'
 import type { BaselineReport, JobStatus, Lane, TestCounts, TestFailure } from '../engine/types'
 import { validate } from '../engine/validate'
+import { logMirror } from './jobsource'
 import { clampTail, readFiltered } from './logfile'
 import type { LogView } from './logfile'
 import { Lanes } from './queue'
@@ -131,6 +132,13 @@ interface RegisterOptions {
   argv: string[]
   resolvedArgv: string[]
   env: NodeJS.ProcessEnv
+  /**
+   * Whether to mirror the job's log into the registry's output ring as a pull
+   * source. True for a command, whose log *is* its output and is the only thing
+   * `job_output` could read; false for a sub-tool, which narrates its own
+   * progress through `JobHandle.append`.
+   */
+  mirrorOutput: boolean
   body: JobBody
 }
 
@@ -209,6 +217,7 @@ export class BridgeEngine {
       argv: plan.argv,
       resolvedArgv: plan.resolvedArgv,
       env: plan.env,
+      mirrorOutput: true,
       body: async (record, job) => {
         const run = new ProcessRun(record.resolvedArgv ?? [], record.cwd, record.env, record.logPath)
         record.run = run
@@ -253,6 +262,10 @@ export class BridgeEngine {
       argv: args.displayArgv,
       resolvedArgv: [],
       env: process.env,
+      // A sub-tool narrates through `JobHandle.append` (its own lines about what
+      // it edited), so a second source over the gen-l10n log would interleave
+      // two accounts of the same job. Its log is for the `tail`/`grep` view.
+      mirrorOutput: false,
       body: args.body,
     })
   }
@@ -381,6 +394,11 @@ export class BridgeEngine {
       kind: 'bridge',
       label: record.argv.join(' '),
       owner: options.owner,
+      // The ring is fed from the log the run writes, and the registry owns the
+      // cadence: this is what makes `job_output` see a bridge job's output at
+      // all (see `jobsource.ts` for the measurement that made it a fix rather
+      // than a feature).
+      output: logMirror(options.mirrorOutput ? record.logPath : null),
       run: (job: JobHandle): JobHooks => {
         record.id = job.id
         this.records.set(job.id, record)

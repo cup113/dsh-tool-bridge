@@ -159,12 +159,24 @@ _Avoid_: narrowing, subset run (it is not a run over a subset)
 **Job**:
 A `ctx.jobs` job owned by the calling session, kind `bridge`; the harness's own
 job runtime owns its identity, its output ring, its kill and its completion
-notice, and `job_output`/`job_kill` are how the model reads and stops it.
+notice, and `job_output`/`job_kill` are how the model reads and stops it. The
+ring is fed by the **Log mirror** so that promise is true for a **Job** and not
+only for the sub-tool that narrates itself (ADR-0009).
 _Avoid_: task, run, invocation, process
 
 **Job status**:
 `queued` → `running` → `done` | `failed` | `killed`.
 _Avoid_: pending, success, error, cancelled
+
+**Log mirror**:
+The `JobOutputSource` that reads a **Job**'s log file into the harness's output
+ring, so `job_output` returns what the job printed instead of an empty ring
+(ADR-0009). The log stays the source of truth — the mirror copies nothing in the
+plugin, and advertises the same file as its `spillPath` — and it is bounded at
+4 MiB, past which the read is lossy and the file is the answer. Offsets are UTF-8
+bytes and a multi-byte character is never split across a read.
+_Avoid_: output capture, tee, ring writer (the registry pumps it; the plugin only
+reads the file)
 
 **Queue**:
 A single-worker line **Queue-lane** **Jobs** wait in, one per **Working
@@ -453,6 +465,8 @@ kept under that term.
 - "the **Working directory** is still boot-scoped" — resolved: it is submit-scoped. It is the calling session's `cwd` fixed at submit time, so a job runs in the directory its session was in; the invariant that no request can retarget it survives (ADR-0002), the boot-scoped-ness does not.
 - "`wait: false` sends a job to the background" — resolved: no such field. A job is either awaited inside the call or submitted with `background: true`; the harness's `job_output`, `job_kill` and
 completion notices are the same either way.
+- "`job_output` shows a bridge job's output" — it did not, and every read of a bridge job returned `(no new output)` whatever the job did: the tool's output went to its own log file while `job_output` reads the harness's output ring, and nothing wrote to that ring. Fixed by the **Log mirror** (ADR-0009). The failure was silent by construction — a well-formed empty answer for a job that passed, failed, was still running or had settled — which is why it survived a session's worth of use.
+- "the job's output ring is the plugin's" — resolved: it is the harness's, the plugin only supplies a **Log mirror** source, and the registry owns the read cadence. That split is what made the bug look like the harness's for as long as it did.
 - "a timed-out `bridge_run` killed my job" — resolved: it did not. Expiry returns the **Job** as it stands (`queued`/`running`, with `aheadOf`) and nothing is killed; read it on with `job_output`.
 - "a browser tool is a **Job** because the plugin hosts it" — resolved: it is not. It creates no **Job**, appears in no **Lane**, has no log and no **Digest**; it belongs to the **Scoped mount**.
 - "destructive git" was used to mean *history rewriting* — resolved: **destructive** = irreversible **and** not confined to named paths, which is why `restore .` is refused but `restore -- <path>` is allowed.
